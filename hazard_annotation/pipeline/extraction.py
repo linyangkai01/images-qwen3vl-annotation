@@ -11,6 +11,11 @@ from __future__ import annotations
 from collections import defaultdict
 from pathlib import Path
 
+from hazard_annotation.inference import (
+    check_video_duration,
+    render_duration_notice,
+    split_duration_segments,
+)
 from hazard_annotation.keyframes import KeyframeExtractor, KeyframeSource
 from traffic_cv_closed_loop.adapters.yolo import build_detector
 from traffic_cv_closed_loop.config import ProjectConfig
@@ -47,6 +52,25 @@ def run_extraction(config: ProjectConfig) -> dict[str, object]:
     extractor = KeyframeExtractor(config, detector=detector)
     sources, warnings = _discover_sources(config)
 
+    # --- 视频时长校验（私有多模态模型算力限制） -------------------------- #
+    duration_report = None
+    for source in sources:
+        if source.video_path is None:
+            continue
+        report = check_video_duration(source.video_path, config)
+        print(render_duration_notice(report))
+        warnings.extend(f"{source.source_id}:{code}" for code in report.warnings)
+        if report.action == "segment":
+            segments = split_duration_segments(
+                report.duration_seconds, config.inference_segment_seconds
+            )
+            print(
+                f"          建议分段（共 {len(segments)} 段）："
+                + "、".join(f"{s:.0f}-{e:.0f}s" for s, e in segments[:5])
+                + (" …" if len(segments) > 5 else "")
+            )
+        duration_report = report
+
     records = []
     per_source: dict[str, dict[str, int]] = {}
     for source in sources:
@@ -76,6 +100,8 @@ def run_extraction(config: ProjectConfig) -> dict[str, object]:
         "video_path": config.video.video_path,
         "input_frames_dir": str(config.input_frames_dir),
         "detector_mode": config.yolo_detector,
+        "inference_backend": config.inference_backend,
+        "video_duration": duration_report.to_dict() if duration_report else None,
         "source_count": len(sources),
         "per_source": per_source,
         "totals": totals,

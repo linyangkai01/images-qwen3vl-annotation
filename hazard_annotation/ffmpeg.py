@@ -15,6 +15,8 @@ from pathlib import Path
 
 _FPS_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*fps")
 _PTS_TIME_PATTERN = re.compile(r"pts_time:(\d+(?:\.\d+)?)")
+#: ``Duration: 00:01:23.45,`` from ``ffmpeg -i`` stderr (fallback path).
+_DURATION_PATTERN = re.compile(r"Duration:\s*(\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
 #: First line of ``ffmpeg -version``, e.g. ``ffmpeg version 9.0.1-...``; the
 #: capture is the version token right after the word ``version``.
 _VERSION_TOKEN = re.compile(r"\bversion\b\s+(\S+)", re.IGNORECASE)
@@ -42,6 +44,26 @@ def _decode_process_output(payload: bytes | str | None) -> str:
         except UnicodeDecodeError:
             continue
     return payload.decode("utf-8", errors="replace")
+
+
+def _parse_seconds(text: str) -> float | None:
+    """Parse ``"83.456"`` / ``"83"`` / ``"00:01:23.456"`` into seconds."""
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+    if ":" in cleaned:
+        parts = cleaned.split(":")
+        if len(parts) != 3:
+            return None
+        try:
+            hours, minutes, seconds = (float(part) for part in parts)
+        except ValueError:
+            return None
+        return hours * 3600.0 + minutes * 60.0 + seconds
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
 
 
 class FfmpegRunner:
@@ -132,6 +154,62 @@ class FfmpegRunner:
             return float(match.group(1))
         except ValueError:
             return 0.0
+
+    def probe_duration(self, video: str | Path) -> float:
+        """Return the source duration in seconds, or ``0.0`` when unknown.
+
+        Prefers ``ffprobe`` (exact container duration); falls back to parsing
+        ``ffmpeg -i`` stderr when ``ffprobe`` is unavailable. Never raises for a
+        missing/undecodable file — callers treat ``0.0`` as "unknown" and decide
+        whether that is fatal.
+        """
+        self._ensure_available()
+        path = str(video)
+
+        # 1) ffprobe：优先，拿的是容器精确时长
+        ffprobe_binary = self._ffprobe_binary()
+        if ffprobe_binary:
+            completed = subprocess.run(
+                [
+                    ffprobe_binary,
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    path,
+                ],
+                check=False,
+                capture_output=True,
+                text=False,
+            )
+            probe_text = _decode_process_output(completed.stdout).strip()
+            parsed = _parse_seconds(probe_text)
+            if parsed is not None:
+                return parsed
+
+        # 2) 回退：从 `ffmpeg -i` 的 stderr 里抠 Duration
+        completed = subprocess.run(
+            [self.binary, "-hide_banner", "-i", path],
+            check=False,
+            capture_output=True,
+            text=False,
+        )
+        stderr_text = _decode_process_output(completed.stderr)
+        match = _DURATION_PATTERN.search(stderr_text)
+        if not match:
+            return 0.0
+        hours, minutes, seconds = (float(part) for part in match.groups())
+        return hours * 3600.0 + minutes * 60.0 + seconds
+
+    def _ffprobe_binary(self) -> str:
+        """Locate ``ffprobe`` next to ``ffmpeg``, else fall back to PATH."""
+        binary_path = Path(self.binary)
+        if binary_path.parent != Path("."):
+            candidate = binary_path.with_name(
+                "ffprobe" + (binary_path.suffix or "")
+            )
+            if candidate.exists():
+                return str(candidate)
+        return "ffprobe"
 
     def coarse_sample(
         self,

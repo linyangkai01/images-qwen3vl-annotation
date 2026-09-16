@@ -329,6 +329,23 @@ class ProjectConfig:
     qwen_json_repair: bool = True
     qwen_combined_call: bool = True
     qwen_concurrency: int = 1
+    #: 私有 Ollama-native 接口的 ``images`` 传参方式：
+    #: ``array`` = JSON 数组（默认，对齐接口文档示例）；
+    #: ``comma_joined`` = 单个字符串，多张图 base64 之间用英文逗号拼接。
+    qwen_images_mode: str = "array"
+    #: 传给 ``/api/generate`` 的 ``options`` 块（temperature / max_tokens 等）。
+    qwen_options: dict[str, Any] = field(default_factory=dict)
+    qwen_stream: bool = False
+    #: 推理途径选择：mock | local_yolo | server_yolo | private_vlm
+    inference_backend: str = "mock"
+    #: 私有多模态模型的视频时长上限（秒）。超过则按 on_over_limit 处置。
+    inference_max_video_seconds: float = 60.0
+    #: 超限处置：warn（告警放行）| error（直接报错）| segment（自动分段）
+    inference_on_over_limit: str = "warn"
+    #: segment 模式下的分段长度（秒），默认留 5 秒余量。
+    inference_segment_seconds: float = 55.0
+    #: ``inference`` 段的原始字典（供 server_yolo 等读取 server.* 子项）。
+    raw_inference: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def load(cls, config_path: str | Path) -> "ProjectConfig":
@@ -348,6 +365,7 @@ class ProjectConfig:
         knowledge_cfg = raw.get("knowledge", {})
         hazard_cfg = raw.get("hazard", {})
         visualization_cfg = raw.get("visualization", {})
+        inference_cfg = raw.get("inference", {})
 
         train_split = float(pipeline_cfg.get("train_split", 0.7))
         val_split = float(pipeline_cfg.get("val_split", 0.2))
@@ -429,7 +447,16 @@ class ProjectConfig:
             qwen_endpoint=str(qwen_cfg.get("endpoint", "") or ""),
             qwen_request_path=str(qwen_cfg.get("request_path", "/chat/completions")),
             qwen_model=str(qwen_cfg.get("model", "Qwen/Qwen2.5-VL-72B-Instruct")),
-            qwen_api_key_env=str(qwen_cfg.get("api_key_env", "QWEN_API_KEY")),
+            qwen_api_key_env=str(
+                qwen_cfg.get(
+                    "api_key_env",
+                    # 私有 VLM 途径用更贴切的默认环境变量名，避免与公网 Qwen 混淆
+                    "LAB_VLM_TOKEN"
+                    if str(qwen_cfg.get("provider", "mock")).lower()
+                    in ("private_vlm", "lab_vlm", "ollama_native")
+                    else "QWEN_API_KEY",
+                )
+            ),
             qwen_require_api_key=bool(qwen_cfg.get("require_api_key", True)),
             qwen_timeout_seconds=int(qwen_cfg.get("timeout_seconds", 60)),
             qwen_max_retries=int(qwen_cfg.get("max_retries", 2)),
@@ -477,6 +504,14 @@ class ProjectConfig:
             qwen_json_repair=bool(qwen_cfg.get("json_repair", True)),
             qwen_combined_call=bool(qwen_cfg.get("combined_call", True)),
             qwen_concurrency=int(qwen_cfg.get("concurrency", 1)),
+            qwen_images_mode=str(qwen_cfg.get("images_mode", "array")),
+            qwen_options=_json_dict(qwen_cfg.get("options")),
+            qwen_stream=bool(qwen_cfg.get("stream", False)),
+            inference_backend=str(inference_cfg.get("backend", "mock")),
+            inference_max_video_seconds=float(inference_cfg.get("max_video_seconds", 60.0)),
+            inference_on_over_limit=str(inference_cfg.get("on_over_limit", "warn")),
+            inference_segment_seconds=float(inference_cfg.get("segment_seconds", 55.0)),
+            raw_inference=_json_dict(inference_cfg),
         )
         config.validate()
         return config
@@ -492,6 +527,22 @@ class ProjectConfig:
             raise ValueError("qwen.max_retries must be >= 0")
         if self.qwen_timeout_seconds <= 0:
             raise ValueError("qwen.timeout_seconds must be >= 1")
+        if self.qwen_images_mode not in ("array", "comma_joined"):
+            raise ValueError("qwen.images_mode must be 'array' or 'comma_joined'")
+        if self.inference_backend not in ("mock", "local_yolo", "server_yolo", "private_vlm"):
+            raise ValueError(
+                "inference.backend must be one of mock / local_yolo / server_yolo / private_vlm"
+            )
+        if self.inference_max_video_seconds <= 0:
+            raise ValueError("inference.max_video_seconds must be > 0")
+        if self.inference_on_over_limit not in ("warn", "error", "segment"):
+            raise ValueError("inference.on_over_limit must be one of warn / error / segment")
+        if self.inference_segment_seconds <= 0:
+            raise ValueError("inference.segment_seconds must be > 0")
+        if self.inference_segment_seconds > self.inference_max_video_seconds:
+            raise ValueError(
+                "inference.segment_seconds must be <= inference.max_video_seconds"
+            )
         if self.yolo_epochs <= 0:
             raise ValueError("yolo.epochs must be >= 1")
         if self.yolo_batch == 0:

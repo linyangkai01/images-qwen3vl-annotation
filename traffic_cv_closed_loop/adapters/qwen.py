@@ -632,6 +632,152 @@ class OpenAICompatibleQwenAnnotator:
         return detections, hazard_report, payload
 
 
+class PrivateVlmAnnotator(OpenAICompatibleQwenAnnotator):
+    """Adapter for the lab's private Ollama-native ``/api/generate`` endpoint.
+
+    Three things differ from the OpenAI-compatible path:
+
+    1. **Request body** is ``{model, prompt, options, stream, images}`` instead
+       of ``{model, messages: [...]}``.
+    2. **Images** travel as *raw* base64 (no ``data:`` URL prefix). By default
+       they go in an ``images`` array; when ``qwen.images_mode=comma_joined``
+       they are folded into a single string joined by English commas, which is
+       what some private deployments expect.
+    3. **Reply text** lives in the top-level ``response`` field rather than
+       ``choices[0].message.content``.
+
+    Everything else — prompt assembly, thinking-aware JSON parsing, hazard
+    back-fill, retry/backoff, review-queue routing — is inherited unchanged, so
+    the private endpoint is a drop-in swap for the OpenAI-compatible one.
+
+    Auth is a plain ``Authorization: Bearer <token>`` header sourced from the
+    environment variable named by ``qwen.api_key_env`` (default
+    ``LAB_VLM_TOKEN``). The token is never written to config or logs.
+    """
+
+    @property
+    def provider_label(self) -> str:
+        return "private_vlm"
+
+    def encode_images(self, image_paths: list[Path]) -> list[str] | str:
+        """Base64-encode ``image_paths`` per ``qwen.images_mode``.
+
+        Returns a list for ``array`` mode, or one comma-joined string for
+        ``comma_joined`` mode. Public so callers/tests can exercise the
+        encoding without a live endpoint.
+        """
+        encoded = [
+            base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
+            for image_path in image_paths
+        ]
+        if self.config.qwen_images_mode == "comma_joined":
+            return ",".join(encoded)
+        return encoded
+
+    def _build_request_payload(
+        self, prompt_text: str, image_path: Path
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        return self._build_request_payload_multi(prompt_text, [image_path])
+
+    def _build_request_payload_multi(
+        self, prompt_text: str, image_paths: list[Path]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        images = self.encode_images(image_paths)
+
+        options: dict[str, Any] = {
+            "temperature": self.config.qwen_temperature,
+            "max_tokens": self.config.qwen_max_tokens,
+        }
+        options.update(self.config.qwen_options)
+
+        payload: dict[str, Any] = {
+            "model": self.config.qwen_model,
+            "prompt": prompt_text,
+            "options": options,
+            "stream": self.config.qwen_stream,
+            "images": images,
+        }
+        if not self.config.qwen_enable_thinking:
+            payload["think"] = False
+        payload.update(self.config.qwen_extra_body)
+
+        request_preview = {
+            "endpoint": self.config.qwen_chat_endpoint,
+            "model": self.config.qwen_model,
+            "provider": self.provider_label,
+            "images_mode": self.config.qwen_images_mode,
+            "image_count": len(image_paths),
+            "image_paths": [str(path) for path in image_paths],
+            "options": options,
+            "stream": self.config.qwen_stream,
+            "enable_thinking": self.config.qwen_enable_thinking,
+            "prompt_preview": prompt_text[:800],
+            "auth_env": self.config.qwen_api_key_env,
+            "custom_header_names": sorted(self.config.qwen_headers.keys()),
+            "header_env_names": self.config.qwen_header_env,
+        }
+        return payload, request_preview
+
+    def _request(self, prompt_text: str, image_path: Path) -> tuple[str, dict[str, Any]]:
+        return self._request_multi(prompt_text, [image_path])
+
+    def _request_multi(
+        self, prompt_text: str, image_paths: list[Path]
+    ) -> tuple[str, dict[str, Any]]:
+        headers = self._build_headers()
+        payload, request_preview = self._build_request_payload_multi(
+            prompt_text, image_paths
+        )
+
+        started = time.perf_counter()
+        response_payload = self._post_json(payload=payload, headers=headers)
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+
+        content = response_payload.get("response")
+        if content is None:
+            raise ValueError(
+                "Private VLM response does not contain a 'response' field: "
+                f"{str(response_payload)[:400]}"
+            )
+
+        base_payload = {
+            "provider": self.provider_label,
+            "elapsed_ms": elapsed_ms,
+            "done": response_payload.get("done"),
+            "finish_reason": response_payload.get("done_reason"),
+            "request": request_preview,
+            "response": response_payload,
+        }
+        return str(content), base_payload
+
+    def annotate_multi(
+        self,
+        image_paths: list[Path],
+        prompt_text: str,
+    ) -> tuple[list[Detection], dict[str, Any], dict[str, Any]]:
+        """Send several frames in one call and parse the combined answer.
+
+        Mirrors :meth:`annotate_combined` but takes an explicit image list, so
+        a caller can batch a handful of adjacent keyframes into a single
+        request and let the model reason across them.
+        """
+        content, base_payload = self._request_multi(prompt_text, image_paths)
+        try:
+            parsed_payload = self.parser.parse(content)
+        except (ValueError, json.JSONDecodeError) as error:
+            payload = dict(base_payload)
+            payload.update({"parse_error": str(error), "content": content, "parsed": None})
+            raise _AnnotationParseError(str(error), payload) from error
+
+        objects_payload, hazard_report = _split_combined(parsed_payload)
+        detections = _load_detection_payload(
+            objects_payload, self.config.labels, source="private-vlm-api"
+        )
+        payload = dict(base_payload)
+        payload["parsed"] = parsed_payload
+        return detections, hazard_report, payload
+
+
 class _AnnotationParseError(RuntimeError):
     """Raised when a model response cannot be parsed into JSON."""
 
@@ -640,10 +786,23 @@ class _AnnotationParseError(RuntimeError):
         self.raw_payload = raw_payload
 
 
-def build_qwen_annotator(config: ProjectConfig) -> MockQwenAnnotator | OpenAICompatibleQwenAnnotator:
+def build_qwen_annotator(
+    config: ProjectConfig,
+) -> MockQwenAnnotator | OpenAICompatibleQwenAnnotator | PrivateVlmAnnotator:
+    """Select the annotator backend from ``qwen.provider``.
+
+    Supported values:
+
+    * ``mock`` — offline sidecar-driven, no network.
+    * ``openai_compatible`` / ``local_openai`` — ``/chat/completions`` style.
+    * ``private_vlm`` — the lab's Ollama-native ``/api/generate`` endpoint
+      (raw base64 images, ``Authorization: Bearer`` token).
+    """
     provider = config.qwen_provider.lower()
     if provider == "mock":
         return MockQwenAnnotator(config)
     if provider in ("openai_compatible", "local_openai"):
         return OpenAICompatibleQwenAnnotator(config)
+    if provider in ("private_vlm", "lab_vlm", "ollama_native"):
+        return PrivateVlmAnnotator(config)
     raise ValueError(f"Unsupported qwen provider: {config.qwen_provider}")
