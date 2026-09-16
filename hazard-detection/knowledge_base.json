@@ -1,0 +1,1088 @@
+{
+  "meta": {
+    "version": "1.0.0",
+    "description": "施工现场规范化隐患识别知识库",
+    "scenes": [
+      "吊装作业",
+      "高处作业"
+    ],
+    "total_hazards": 58,
+    "updated": "2026-07-13"
+  },
+  "scenes": [
+    {
+      "scene_id": "S1",
+      "scene_name": "吊装作业",
+      "scene_aliases": [
+        "吊装",
+        "起重",
+        "行车吊运",
+        "龙门吊",
+        "天车"
+      ],
+      "visual_keywords": [
+        "吊钩",
+        "吊链",
+        "吊带",
+        "钢丝绳",
+        "行车",
+        "龙门吊",
+        "起重机",
+        "吊物",
+        "平衡梁",
+        "托架",
+        "料斗"
+      ],
+      "hazard_categories": [
+        {
+          "category_id": "D-1",
+          "category_name": "吊索具缺陷与使用不当",
+          "visual_focus": [
+            "绳索状态",
+            "吊链缠绕",
+            "吊带磨损",
+            "吊钩连接",
+            "承重标识"
+          ],
+          "hazards": [
+            {
+              "id": "D-1-1",
+              "name": "绳索交叉缠绕",
+              "description": "吊装用绳索存在交叉或缠绕状态，交叉、缠绕两者均违规",
+              "visual_cues": [
+                "绳索呈X形交叉",
+                "多股绳索扭绞在一起",
+                "绳索不自然弯曲"
+              ],
+              "severity": "high",
+              "risk_type": "物体打击",
+              "norm_ref": "GB 6067.1-2010",
+              "action": "停止作业，重新整理绳索"
+            },
+            {
+              "id": "D-1-2",
+              "name": "绳索缠绕",
+              "description": "绳索自身缠绕，影响承载能力",
+              "visual_cues": [
+                "绳索扭结",
+                "绳圈不规则"
+              ],
+              "severity": "high",
+              "risk_type": "物体打击",
+              "norm_ref": "GB 6067.1-2010",
+              "action": "停止作业，解除缠绕"
+            },
+            {
+              "id": "D-1-3",
+              "name": "吊链/吊带与硬质表面接触无防割措施",
+              "description": "吊链或吊带与吊装物硬质表面直接接触，未使用衬垫、保护套或软性材料隔离",
+              "visual_cues": [
+                "吊带贴合金属棱角",
+                "无衬垫可见",
+                "吊带在锐利边缘处"
+              ],
+              "severity": "high",
+              "risk_type": "物体打击",
+              "norm_ref": "GB/T 16271-2009",
+              "action": "加装衬垫或保护套"
+            },
+            {
+              "id": "D-1-4",
+              "name": "吊带存在割口损伤",
+              "description": "吊带存在可见割口或损伤痕迹，使用前未检查",
+              "visual_cues": [
+                "吊带表面有切口",
+                "纤维断裂",
+                "局部磨损严重"
+              ],
+              "severity": "high",
+              "risk_type": "物体打击",
+              "norm_ref": "GB/T 16271-2009",
+              "action": "更换吊带"
+            },
+            {
+              "id": "D-1-5",
+              "name": "吊钩与被吊物品连接不牢固",
+              "description": "吊钩与吊物之间连接松动或不可靠",
+              "visual_cues": [
+                "吊钩开口过大",
+                "连接处有间隙",
+                "吊物倾斜"
+              ],
+              "severity": "critical",
+              "risk_type": "物体打击",
+              "norm_ref": "GB 6067.1-2010",
+              "action": "重新连接，确保锁紧"
+            },
+            {
+              "id": "D-1-6",
+              "name": "吊具与索具未标识承重重量",
+              "description": "吊具和索具上未标注额定起重量标识",
+              "visual_cues": [
+                "无铭牌",
+                "标识模糊不清",
+                "无吨位标记"
+              ],
+              "severity": "medium",
+              "risk_type": "超载",
+              "norm_ref": "GB 6067.1-2010",
+              "action": "补装承重标识牌"
+            },
+            {
+              "id": "D-1-7",
+              "name": "吊装无牵引绳",
+              "description": "吊装作业未使用牵引绳控制吊物方向",
+              "visual_cues": [
+                "人员直接用手推吊物",
+                "无绳索从吊物引出"
+              ],
+              "severity": "medium",
+              "risk_type": "物体打击",
+              "norm_ref": "安全操作规程",
+              "action": "配备牵引绳",
+              "note": "可能存在视频角度问题，需确认"
+            }
+          ]
+        },
+        {
+          "category_id": "D-2",
+          "category_name": "吊架/托架使用不规范",
+          "visual_focus": [
+            "吊架平衡状态",
+            "托架固定方式",
+            "卡板使用"
+          ],
+          "hazards": [
+            {
+              "id": "D-2-1",
+              "name": "吊架不平衡",
+              "description": "吊架在吊装过程中呈现明显倾斜或不平衡状态",
+              "visual_cues": [
+                "吊架一侧偏低",
+                "吊物重心偏移",
+                "吊链长度不一致"
+              ],
+              "severity": "high",
+              "risk_type": "物体倾覆",
+              "action": "调整吊点位置，确保平衡",
+              "norm_ref": "JGJ 276-2012"
+            },
+            {
+              "id": "D-2-2",
+              "name": "吊架下吊链斜拉",
+              "description": "吊架下方的吊链呈斜拉状态而非垂直受力",
+              "visual_cues": [
+                "吊链与垂直方向有明显夹角",
+                "吊链偏向一侧"
+              ],
+              "severity": "medium",
+              "risk_type": "物体打击",
+              "action": "调整吊链位置使其垂直受力",
+              "note": "视觉难以精确识别",
+              "norm_ref": "JGJ 276-2012"
+            },
+            {
+              "id": "D-2-3",
+              "name": "使用卡板吊重物",
+              "description": "使用卡板（托盘）直接吊运重物，属禁止行为",
+              "visual_cues": [
+                "木质/塑料托盘被吊起",
+                "托盘下方有吊带穿过"
+              ],
+              "severity": "high",
+              "risk_type": "物体坠落",
+              "norm_ref": "安全操作规程",
+              "action": "禁止使用卡板吊物，改用料斗或专用吊具"
+            },
+            {
+              "id": "D-2-4",
+              "name": "托架捆绑不牢靠",
+              "description": "托架上物品的捆绑固定不牢固",
+              "visual_cues": [
+                "捆绑带松弛",
+                "物品有滑动痕迹",
+                "捆绑点过少"
+              ],
+              "severity": "high",
+              "risk_type": "物体坠落",
+              "action": "重新捆绑加固",
+              "norm_ref": "JGJ 276-2012"
+            },
+            {
+              "id": "D-2-5",
+              "name": "违规使用托盘作为吊具或承重平台",
+              "description": "将普通托盘当作吊具或承重平台使用",
+              "visual_cues": [
+                "托盘悬空承载重物",
+                "托盘作为吊装中间平台"
+              ],
+              "severity": "high",
+              "risk_type": "物体坠落",
+              "action": "使用专用吊具替代",
+              "norm_ref": "JGJ 276-2012"
+            }
+          ]
+        },
+        {
+          "category_id": "D-3",
+          "category_name": "被吊物品不安全状态",
+          "visual_focus": [
+            "散件固定",
+            "吊物悬停",
+            "平衡梁使用",
+            "吊物位置"
+          ],
+          "hazards": [
+            {
+              "id": "D-3-1",
+              "name": "散件未用料斗吊运/未可靠捆绑固定",
+              "description": "散件物料未放入料斗或未进行可靠捆绑直接吊运",
+              "visual_cues": [
+                "零散物品堆放无容器",
+                "物料无捆绑带",
+                "物品松散"
+              ],
+              "severity": "high",
+              "risk_type": "物体坠落",
+              "norm_ref": "安全操作规程",
+              "action": "必须用料斗或其他防脱落措施"
+            },
+            {
+              "id": "D-3-2",
+              "name": "小构件吊装未采取防脱落措施",
+              "description": "小型构件吊装时没有防脱落保险措施",
+              "visual_cues": [
+                "小件仅单点悬挂",
+                "无防脱扣",
+                "无二次保护"
+              ],
+              "severity": "high",
+              "risk_type": "物体坠落",
+              "action": "增加防脱落措施",
+              "norm_ref": "JGJ 276-2012"
+            },
+            {
+              "id": "D-3-3",
+              "name": "大件物品未使用平衡梁",
+              "description": "大型/重型物品吊装未使用平衡梁",
+              "visual_cues": [
+                "大型工件直接用吊链",
+                "工件倾斜",
+                "无横梁结构"
+              ],
+              "severity": "high",
+              "risk_type": "物体倾覆",
+              "action": "使用平衡梁吊装",
+              "norm_ref": "JGJ 276-2012"
+            },
+            {
+              "id": "D-3-4",
+              "name": "重物直接压在吊装带上",
+              "description": "重物直接压在吊装带上，可能造成吊带损伤",
+              "visual_cues": [
+                "吊带被重物压扁",
+                "吊带受压变形"
+              ],
+              "severity": "medium",
+              "risk_type": "物体坠落",
+              "action": "调整吊带位置或使用保护措施",
+              "norm_ref": "JGJ 276-2012"
+            },
+            {
+              "id": "D-3-5",
+              "name": "吊物悬停在通道上方",
+              "description": "吊物悬停在人员通行通道上方",
+              "visual_cues": [
+                "吊物下方有通道标识",
+                "通道有人员活动",
+                "吊物位于道路正上方"
+              ],
+              "severity": "critical",
+              "risk_type": "物体打击",
+              "action": "立即移开吊物，禁止在通道上方悬停",
+              "norm_ref": "GB 6067.1-2010"
+            },
+            {
+              "id": "D-3-6",
+              "name": "吊物悬停在空中",
+              "description": "吊物在无操作状态下悬停在空中",
+              "visual_cues": [
+                "吊物离地但未移动",
+                "操作人员不在操控位"
+              ],
+              "severity": "high",
+              "risk_type": "物体坠落",
+              "action": "将吊物放至地面或指定位置",
+              "norm_ref": "GB 6067.1-2010"
+            },
+            {
+              "id": "D-3-7",
+              "name": "相邻龙门吊同时运行，重物长时间悬停",
+              "description": "相邻龙门吊同时作业导致重物长时间悬停",
+              "visual_cues": [
+                "两台龙门吊并排",
+                "吊物停滞不动",
+                "操作人员等待"
+              ],
+              "severity": "high",
+              "risk_type": "碰撞/坠落",
+              "action": "协调作业时序，避免同时运行",
+              "norm_ref": "GB/T 6067.5-2014"
+            }
+          ]
+        },
+        {
+          "category_id": "D-4",
+          "category_name": "作业环境与照明",
+          "visual_focus": [
+            "照明条件",
+            "场地整洁",
+            "吊装行为"
+          ],
+          "hazards": [
+            {
+              "id": "D-4-1",
+              "name": "吊装作业照明不足",
+              "description": "吊装作业区域照明不满足要求",
+              "visual_cues": [
+                "画面昏暗",
+                "阴影区域大",
+                "局部看不清"
+              ],
+              "severity": "medium",
+              "risk_type": "多种风险",
+              "action": "增设照明设备",
+              "norm_ref": "GB 50034-2013"
+            },
+            {
+              "id": "D-4-2",
+              "name": "吊装作业区域违规停放电瓶车",
+              "description": "吊装作业区域内停放电瓶车等无关车辆",
+              "visual_cues": [
+                "区域内有电瓶车",
+                "车辆靠近吊装范围"
+              ],
+              "severity": "medium",
+              "risk_type": "物体打击",
+              "action": "清移电瓶车，设置警戒区",
+              "norm_ref": "JGJ 59-2011"
+            },
+            {
+              "id": "D-4-3",
+              "name": "歪拉斜吊行为",
+              "description": "吊装时采用歪拉斜吊的方式",
+              "visual_cues": [
+                "吊链与垂直方向夹角过大",
+                "吊物被横向拖拽",
+                "非垂直起吊"
+              ],
+              "severity": "high",
+              "risk_type": "物体倾覆",
+              "norm_ref": "十不吊",
+              "action": "纠正吊装角度，垂直起吊"
+            }
+          ]
+        },
+        {
+          "category_id": "D-5",
+          "category_name": "人员不安全行为",
+          "visual_focus": [
+            "安全帽",
+            "反光背心",
+            "人员位置",
+            "操作行为"
+          ],
+          "hazards": [
+            {
+              "id": "D-5-1",
+              "name": "人员未佩戴安全帽",
+              "description": "现场人员未佩戴安全帽",
+              "visual_cues": [
+                "头部无安全帽",
+                "安全帽拿在手上未戴",
+                "安全帽佩戴不规范"
+              ],
+              "severity": "high",
+              "risk_type": "物体打击",
+              "action": "要求佩戴安全帽",
+              "norm_ref": "GB 2811-2019"
+            },
+            {
+              "id": "D-5-2",
+              "name": "人员未穿着反光背心或安全警示服",
+              "description": "现场人员未穿戴反光背心或安全警示服",
+              "visual_cues": [
+                "无荧光色衣物",
+                "无反光条"
+              ],
+              "severity": "medium",
+              "risk_type": "人员伤害",
+              "action": "要求穿戴反光背心",
+              "norm_ref": "GB/T 11651-2008"
+            },
+            {
+              "id": "D-5-3",
+              "name": "人员站在吊物下方/上方",
+              "description": "人员违规站立在吊物下方或上方区域",
+              "visual_cues": [
+                "人影在吊物正下方",
+                "人员在吊物上方平台",
+                "未保持安全距离"
+              ],
+              "severity": "critical",
+              "risk_type": "物体打击",
+              "action": "立即撤离吊物下方区域",
+              "norm_ref": "GB 6067.1-2010"
+            },
+            {
+              "id": "D-5-4",
+              "name": "吊物未放稳人员即上车操作",
+              "description": "吊物尚未放稳，人员就上车或靠近操作",
+              "visual_cues": [
+                "吊物仍在晃动",
+                "人员已攀上车辆"
+              ],
+              "severity": "high",
+              "risk_type": "物体打击",
+              "action": "等吊物完全放稳后再操作",
+              "norm_ref": "JGJ 276-2012"
+            },
+            {
+              "id": "D-5-5",
+              "name": "人员离开现场未收回吊链",
+              "description": "作业人员离开现场时吊链未收回",
+              "visual_cues": [
+                "吊链悬垂在地面",
+                "现场无操作人员"
+              ],
+              "severity": "low",
+              "risk_type": "绊倒/损坏",
+              "action": "收回吊链并妥善存放",
+              "norm_ref": "JGJ 276-2012"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "scene_id": "S2",
+      "scene_name": "高处作业",
+      "scene_aliases": [
+        "高空作业",
+        "登高作业",
+        "高处施工"
+      ],
+      "visual_keywords": [
+        "脚手架",
+        "安全带",
+        "安全绳",
+        "防护栏",
+        "梯子",
+        "A字梯",
+        "马凳",
+        "移动脚手架",
+        "生命绳",
+        "安全帽"
+      ],
+      "scope_definition": {
+        "includes": [
+          "攀登与悬空作业",
+          "洞口与临边作业",
+          "坡度大于45度的斜坡上作业"
+        ],
+        "height_threshold": "2m以上"
+      },
+      "hazard_categories": [
+        {
+          "category_id": "G-1",
+          "category_name": "防护设施缺失",
+          "visual_focus": [
+            "防护栏",
+            "脚手架完整性",
+            "马凳护栏",
+            "临边防护"
+          ],
+          "hazards": [
+            {
+              "id": "G-1-1",
+              "name": "平台无防护栏/脚手架护栏缺失",
+              "description": "高处作业平台或脚手架缺少防护栏杆",
+              "visual_cues": [
+                "平台边缘无栏杆",
+                "脚手架外侧无护栏",
+                "栏杆断开"
+              ],
+              "severity": "critical",
+              "risk_type": "高处坠落",
+              "norm_ref": "JGJ 130-2011",
+              "action": "立即搭设防护栏，2m以上必须设置"
+            },
+            {
+              "id": "G-1-2",
+              "name": "脚手架连接处或转角处缺失",
+              "description": "脚手架、脚手板在连接处或转角处存在缺口",
+              "visual_cues": [
+                "板与板之间有缝隙",
+                "转角处无搭接",
+                "脚手板断裂"
+              ],
+              "severity": "high",
+              "risk_type": "高处坠落",
+              "action": "补齐缺口，加固连接",
+              "norm_ref": "GB 51210-2016"
+            },
+            {
+              "id": "G-1-3",
+              "name": "无防护措施的超高马凳",
+              "description": "马凳过高且缺少护栏防护",
+              "visual_cues": [
+                "马凳高度接近人腰",
+                "无侧边护栏",
+                "马凳不稳固"
+              ],
+              "severity": "high",
+              "risk_type": "高处坠落",
+              "action": "加装护栏或更换为脚手架",
+              "norm_ref": "JGJ 202-2010"
+            },
+            {
+              "id": "G-1-4",
+              "name": "高处位置未设防护栏",
+              "description": "屋顶、地面、楼梯、坡道、工作台等＞2m位置未设防护栏",
+              "visual_cues": [
+                "高处边缘无栏杆",
+                "临边无遮挡",
+                "2m以上平台敞开"
+              ],
+              "severity": "critical",
+              "risk_type": "高处坠落",
+              "action": "搭设防护栏",
+              "norm_ref": "JGJ 80-2016"
+            },
+            {
+              "id": "G-1-5",
+              "name": "防护栏杆缺失",
+              "description": "防护栏杆缺失（图片中可能难以辨认）",
+              "visual_cues": [
+                "边缘处无可见栏杆",
+                "栏杆影子不连续"
+              ],
+              "severity": "high",
+              "risk_type": "高处坠落",
+              "action": "确认并补装防护栏杆",
+              "note": "图片难以辨认时需现场核实",
+              "norm_ref": "GB 4053.3-2009"
+            }
+          ]
+        },
+        {
+          "category_id": "G-2",
+          "category_name": "个人防护用品（PPE）",
+          "visual_focus": [
+            "安全帽",
+            "安全带",
+            "安全绳",
+            "防滑鞋"
+          ],
+          "hazards": [
+            {
+              "id": "G-2-1",
+              "name": "人员未佩戴安全帽",
+              "description": "高处作业人员未佩戴安全帽",
+              "visual_cues": [
+                "头部无安全帽",
+                "安全帽未系带"
+              ],
+              "severity": "high",
+              "risk_type": "物体打击",
+              "action": "要求佩戴安全帽",
+              "norm_ref": "GB 2811-2019"
+            },
+            {
+              "id": "G-2-2",
+              "name": "人员未系安全带",
+              "description": "高处作业人员未系安全带",
+              "visual_cues": [
+                "腰间无安全带",
+                "安全带悬挂未使用",
+                "无肩带可见"
+              ],
+              "severity": "critical",
+              "risk_type": "高处坠落",
+              "action": "必须系安全带后方可作业",
+              "norm_ref": "GB 6095-2021"
+            },
+            {
+              "id": "G-2-3",
+              "name": "未系安全绳高空作业",
+              "description": "高处作业人员未系安全绳",
+              "visual_cues": [
+                "身上无绳索连接",
+                "安全绳未挂接"
+              ],
+              "severity": "critical",
+              "risk_type": "高处坠落",
+              "action": "系挂安全绳",
+              "norm_ref": "GB 24543-2009"
+            },
+            {
+              "id": "G-2-4",
+              "name": "未使用防滑鞋",
+              "description": "高处作业人员未穿防滑鞋",
+              "visual_cues": [
+                "穿皮鞋/运动鞋",
+                "非劳保鞋"
+              ],
+              "severity": "medium",
+              "risk_type": "滑倒坠落",
+              "action": "更换防滑劳保鞋",
+              "norm_ref": "GB 21148-2020"
+            }
+          ]
+        },
+        {
+          "category_id": "G-3",
+          "category_name": "安全带/安全绳使用不规范",
+          "visual_focus": [
+            "安全带挂点",
+            "安全绳走向",
+            "使用方式"
+          ],
+          "hazards": [
+            {
+              "id": "G-3-1",
+              "name": "安全带未挂在牢固结构件上",
+              "description": "安全带挂点不牢固，未挂在可靠结构件上",
+              "visual_cues": [
+                "安全带挂在活动构件上",
+                "挂点在管道/栏杆末端",
+                "挂点位置偏低"
+              ],
+              "severity": "critical",
+              "risk_type": "高处坠落",
+              "action": "改挂在牢固结构件上，高挂低用",
+              "norm_ref": "GB 6095-2021"
+            },
+            {
+              "id": "G-3-2",
+              "name": "安全带/安全绳打结使用",
+              "description": "安全带或安全绳打结后使用",
+              "visual_cues": [
+                "绳索有结扣",
+                "安全带缠绕打结"
+              ],
+              "severity": "high",
+              "risk_type": "高处坠落",
+              "action": "解除结扣，正常使用",
+              "norm_ref": "GB 6095-2021"
+            },
+            {
+              "id": "G-3-3",
+              "name": "未增设生命绳/速差防坠器/安全绳自锁器",
+              "description": "不具备安全带系挂条件时未增设安全措施",
+              "visual_cues": [
+                "无生命绳可见",
+                "无防坠器",
+                "周围无可靠挂点"
+              ],
+              "severity": "high",
+              "risk_type": "高处坠落",
+              "action": "增设生命绳、速差防坠器或安全绳自锁器",
+              "norm_ref": "GB 24544-2009"
+            }
+          ]
+        },
+        {
+          "category_id": "G-4",
+          "category_name": "梯具使用不规范",
+          "visual_focus": [
+            "梯子类型",
+            "放置角度",
+            "支撑状态",
+            "人员位置"
+          ],
+          "hazards": [
+            {
+              "id": "G-4-1",
+              "name": "A字梯横跨作业",
+              "description": "在A字梯上进行横跨作业",
+              "visual_cues": [
+                "人员身体侧向伸出梯外",
+                "梯子被横置使用"
+              ],
+              "severity": "high",
+              "risk_type": "高处坠落",
+              "action": "禁止横跨作业",
+              "norm_ref": "GB/T 17889.2-2021"
+            },
+            {
+              "id": "G-4-2",
+              "name": "梯具未放置在平实地面",
+              "description": "梯子放置在不平整或松软的地面上",
+              "visual_cues": [
+                "地面不平",
+                "梯脚陷入泥土",
+                "地面有杂物"
+              ],
+              "severity": "high",
+              "risk_type": "梯子倾倒",
+              "action": "移至平实地面或加垫板",
+              "norm_ref": "GB/T 17889.2-2021"
+            },
+            {
+              "id": "G-4-3",
+              "name": "踢脚之间无固定扣件",
+              "description": "A字梯踢脚之间缺少固定扣件",
+              "visual_cues": [
+                "梯子两侧无横撑连接",
+                "扣件缺失"
+              ],
+              "severity": "medium",
+              "risk_type": "梯子折叠",
+              "action": "安装固定扣件",
+              "norm_ref": "GB/T 17889.1-2021"
+            },
+            {
+              "id": "G-4-4",
+              "name": "梯脚无防滑措施",
+              "description": "梯子底部无防滑橡胶垫或其他防滑措施",
+              "visual_cues": [
+                "梯脚直接接触地面",
+                "无橡胶垫",
+                "地面光滑"
+              ],
+              "severity": "medium",
+              "risk_type": "梯子滑移",
+              "action": "安装防滑脚垫",
+              "norm_ref": "GB/T 17889.2-2021"
+            },
+            {
+              "id": "G-4-5",
+              "name": "禁止单人作业（下方无人稳固梯具）",
+              "description": "使用梯子时下方无人扶持稳固",
+              "visual_cues": [
+                "梯子周围无人",
+                "仅梯上一人作业"
+              ],
+              "severity": "high",
+              "risk_type": "梯子倾倒",
+              "action": "安排专人在下方扶持梯具",
+              "norm_ref": "GB/T 17889.3-2021"
+            },
+            {
+              "id": "G-4-6",
+              "name": "踩于最高梯面作业",
+              "description": "人员站在梯子最高一级踏面上作业",
+              "visual_cues": [
+                "人员双脚在同一高度",
+                "位于梯子最顶端"
+              ],
+              "severity": "high",
+              "risk_type": "高处坠落",
+              "action": "禁止踩最高梯面",
+              "norm_ref": "GB/T 17889.2-2021"
+            },
+            {
+              "id": "G-4-7",
+              "name": "坐/站于A字梯上端两阶和顶端",
+              "description": "人员坐或站在A字梯最上面两阶或顶端",
+              "visual_cues": [
+                "人员位置在梯子顶部",
+                "站姿不稳"
+              ],
+              "severity": "high",
+              "risk_type": "高处坠落",
+              "action": "禁止在上端两阶和顶端作业",
+              "norm_ref": "GB/T 17889.2-2021"
+            },
+            {
+              "id": "G-4-8",
+              "name": "人字梯上部夹角不在35°~45°范围",
+              "description": "人字梯张开角度不规范",
+              "visual_cues": [
+                "梯子张开过宽或过窄",
+                "角度明显不标准"
+              ],
+              "severity": "medium",
+              "risk_type": "梯子倾倒",
+              "action": "调整夹角至35°~45°",
+              "norm_ref": "GB/T 17889.1-2021"
+            },
+            {
+              "id": "G-4-9",
+              "name": "直梯垫高使用",
+              "description": "便携式直梯通过垫高方式增加高度",
+              "visual_cues": [
+                "梯脚垫有砖块/木板",
+                "梯子底部不稳"
+              ],
+              "severity": "high",
+              "risk_type": "梯子倾倒",
+              "action": "禁止垫高，更换合适长度梯子",
+              "norm_ref": "GB/T 17889.2-2021"
+            },
+            {
+              "id": "G-4-10",
+              "name": "直梯工作角度不在70°~80°范围",
+              "description": "直梯与地面夹角不规范",
+              "visual_cues": [
+                "梯子过于倾斜",
+                "梯子过于陡峭"
+              ],
+              "severity": "medium",
+              "risk_type": "梯子倾倒/滑移",
+              "action": "调整角度至70°~80°",
+              "norm_ref": "GB/T 17889.1-2021"
+            },
+            {
+              "id": "G-4-11",
+              "name": "使用便携式梯子下方无人扶持",
+              "description": "便携式梯子使用时下方无扶持人员",
+              "visual_cues": [
+                "梯子底部无人",
+                "仅梯上有人"
+              ],
+              "severity": "high",
+              "risk_type": "梯子倾倒",
+              "action": "安排人员在下方扶持",
+              "norm_ref": "GB/T 17889.3-2021"
+            }
+          ]
+        },
+        {
+          "category_id": "G-5",
+          "category_name": "移动脚手架使用不规范",
+          "visual_focus": [
+            "脚手架轮子",
+            "层数",
+            "移动状态",
+            "载人情况"
+          ],
+          "hazards": [
+            {
+              "id": "G-5-1",
+              "name": "作业中支架受水平冲击/撞击",
+              "description": "移动脚手架在作业中受到水平冲击",
+              "visual_cues": [
+                "脚手架有倾斜",
+                "有碰撞痕迹"
+              ],
+              "severity": "medium",
+              "risk_type": "脚手架倒塌",
+              "action": "避免冲击，加固支架",
+              "norm_ref": "JGJ 202-2010"
+            },
+            {
+              "id": "G-5-2",
+              "name": "移动到位后未锁定轮子/未加斜支腿",
+              "description": "脚手架移动到位后未将轮子锁定或未加斜支腿支撑",
+              "visual_cues": [
+                "轮子刹车未踩下",
+                "无斜支腿",
+                "脚手架可移动"
+              ],
+              "severity": "high",
+              "risk_type": "脚手架滑移",
+              "action": "锁定轮子并加斜支腿",
+              "norm_ref": "JGJ 202-2010"
+            },
+            {
+              "id": "G-5-3",
+              "name": "移动脚手架载人移动",
+              "description": "脚手架上有人时进行移动",
+              "visual_cues": [
+                "架上有人",
+                "脚手架正在位移",
+                "人员在架上晃动"
+              ],
+              "severity": "critical",
+              "risk_type": "高处坠落",
+              "action": "禁止载人移动",
+              "norm_ref": "JGJ 202-2010"
+            },
+            {
+              "id": "G-5-4",
+              "name": "超两层脚手架底部带轮",
+              "description": "超过两层的移动式脚手架底部仍带轮子",
+              "visual_cues": [
+                "脚手架三层以上",
+                "底部可见轮子"
+              ],
+              "severity": "high",
+              "risk_type": "脚手架倾倒",
+              "action": "超两层应拆除轮子",
+              "norm_ref": "JGJ 202-2010"
+            }
+          ]
+        },
+        {
+          "category_id": "G-6",
+          "category_name": "作业行为与环境",
+          "visual_focus": [
+            "交叉作业",
+            "照明条件",
+            "作业行为"
+          ],
+          "hazards": [
+            {
+              "id": "G-6-1",
+              "name": "人员进行横跨作业",
+              "description": "人员在高处进行横跨作业",
+              "visual_cues": [
+                "人员身体伸出作业面外",
+                "跨越栏杆"
+              ],
+              "severity": "high",
+              "risk_type": "高处坠落",
+              "action": "禁止横跨作业",
+              "norm_ref": "JGJ 80-2016"
+            },
+            {
+              "id": "G-6-2",
+              "name": "高处坠落区域内从事交叉作业",
+              "description": "在高处作业坠落范围内从事其他交叉作业，未搭设防护顶棚",
+              "visual_cues": [
+                "下方有其他工种作业",
+                "无防护棚",
+                "坠落半径内有人"
+              ],
+              "severity": "critical",
+              "risk_type": "物体打击",
+              "action": "搭设防护顶棚或错开作业时间",
+              "norm_ref": "JGJ 80-2016"
+            },
+            {
+              "id": "G-6-3",
+              "name": "登高作业照明不足",
+              "description": "高处作业区域照明不满足要求",
+              "visual_cues": [
+                "画面昏暗",
+                "作业区域阴影重"
+              ],
+              "severity": "medium",
+              "risk_type": "多种风险",
+              "action": "增设照明设备",
+              "norm_ref": "GB 50034-2013"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "scene_id": "S3",
+      "scene_name": "通用隐患",
+      "hazards": [
+        {
+          "id": "T-1",
+          "name": "场地积水",
+          "description": "作业场地存在积水",
+          "visual_cues": [
+            "地面有水渍",
+            "反光水面",
+            "排水不畅"
+          ],
+          "severity": "low",
+          "risk_type": "滑倒",
+          "action": "清理积水，改善排水",
+          "norm_ref": "JGJ 146-2013"
+        }
+      ]
+    }
+  ],
+  "ten_no_lift": {
+    "description": "吊装作业'十不吊'红线",
+    "rules": [
+      {
+        "id": "TNR-1",
+        "rule": "超载/重量不明不吊"
+      },
+      {
+        "id": "TNR-2",
+        "rule": "指挥混乱、违章指挥不吊"
+      },
+      {
+        "id": "TNR-3",
+        "rule": "棱角无衬垫不吊"
+      },
+      {
+        "id": "TNR-4",
+        "rule": "埋地物件不吊"
+      },
+      {
+        "id": "TNR-5",
+        "rule": "安全装置失灵不吊"
+      },
+      {
+        "id": "TNR-6",
+        "rule": "吊具捆绑不牢不吊"
+      },
+      {
+        "id": "TNR-7",
+        "rule": "吊下站人、物件带浮件不吊"
+      },
+      {
+        "id": "TNR-8",
+        "rule": "工况情况不明不吊"
+      },
+      {
+        "id": "TNR-9",
+        "rule": "歪拉斜拽不吊"
+      },
+      {
+        "id": "TNR-10",
+        "rule": "光线昏暗视线差不吊"
+      }
+    ]
+  },
+  "crane_six_forbidden": {
+    "description": "行车六严禁",
+    "rules": [
+      {
+        "id": "CSF-1",
+        "rule": "严禁反车制动限位起升机构"
+      },
+      {
+        "id": "CSF-2",
+        "rule": "严禁撞击限位硬停车"
+      },
+      {
+        "id": "CSF-3",
+        "rule": "严禁未稳钩多档位同步操作"
+      },
+      {
+        "id": "CSF-4",
+        "rule": "严禁吊物越人头，吊运离地≤0.5m"
+      },
+      {
+        "id": "CSF-5",
+        "rule": "严禁同柱距停放两台行车"
+      },
+      {
+        "id": "CSF-6",
+        "rule": "严禁同轨吊车互相碰撞"
+      }
+    ]
+  },
+  "severity_levels": {
+    "critical": {
+      "label": "严重",
+      "color": "#FF0000",
+      "action": "立即停止作业"
+    },
+    "high": {
+      "label": "高",
+      "color": "#FF6600",
+      "action": "限期整改"
+    },
+    "medium": {
+      "label": "中",
+      "color": "#FFCC00",
+      "action": "计划整改"
+    },
+    "low": {
+      "label": "低",
+      "color": "#00CC00",
+      "action": "日常关注"
+    }
+  }
+}

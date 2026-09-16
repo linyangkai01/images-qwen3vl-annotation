@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "traffic-cv-closed-loop"
+version = "0.1.0"
+description = "Qwen3VL to YOLO closed-loop training project for intelligent traffic intersections."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "Codex" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+production = [
+  "ultralytics>=8.3.0"
+]
+
+[project.scripts]
+traffic-cv-loop = "traffic_cv_closed_loop.cli:main"
+
+[tool.setuptools]
+include-package-data = true

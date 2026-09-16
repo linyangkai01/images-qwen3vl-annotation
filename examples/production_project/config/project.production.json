@@ -1,0 +1,72 @@
+{
+  "project_name": "智能交通路口闭环训练生产接入模板",
+  "scene": "城市主干道路口，重点关注行人、机动车、公交、信号灯与复杂遮挡场景",
+  "labels": [
+    "person",
+    "car",
+    "bus",
+    "truck",
+    "motorcycle",
+    "traffic_light"
+  ],
+  "input": {
+    "frames_dir": "input/frames"
+  },
+  "output": {
+    "workspace_dir": "workspace"
+  },
+  "pipeline": {
+    "frame_step": 1,
+    "max_frames_per_source": 300,
+    "min_detection_confidence": 0.25,
+    "review_confidence_threshold": 0.85,
+    "include_empty_frames": false,
+    "include_review_queue_in_training": false,
+    "train_split": 0.7,
+    "val_split": 0.2,
+    "test_split": 0.1,
+    "seed": 7
+  },
+  "qwen": {
+    "provider": "openai_compatible",
+    "base_url": "https://ws-qi1jm9l6h7j1j0hl.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+    "endpoint": "",
+    "request_path": "/chat/completions",
+    "prompt_template": "assets/prompts/qwen3vl_traffic_zh.md",
+    "model": "qwen-plus",
+    "api_key_env": "QWEN_API_KEY",
+    "require_api_key": true,
+    "timeout_seconds": 120,
+    "max_retries": 2,
+    "retry_backoff_seconds": 2.0,
+    "temperature": 0.1,
+    "top_p": 0.9,
+    "max_tokens": 4000,
+    "response_format": "json_object",
+    "auth_scheme": "Bearer",
+    "headers": {},
+    "header_env": {},
+    "extra_body": {}
+  },
+  "yolo": {
+    "binary": "yolo",
+    "task": "detect",
+    "detector": "ultralytics",
+    "trainer": "ultralytics",
+    "detector_weights": "weights/yolo11l.pt",
+    "weights": "weights/yolo11l.pt",
+    "detector_confidence": 0.25,
+    "detector_iou": 0.45,
+    "detector_image_size": 1280,
+    "image_size": 640,
+    "epochs": 3,
+    "device": "cpu",
+    "batch": 1,
+    "workers": 0,
+    "patience": 30,
+    "cache": false,
+    "resume": false,
+    "close_mosaic": 10,
+    "save_period": -1
+  }
+}

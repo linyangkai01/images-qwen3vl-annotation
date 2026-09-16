@@ -1,0 +1,46 @@
+{
+  "project_name": "智能交通路口闭环训练示例项目",
+  "scene": "城市十字路口，关注车辆、行人、公交和信号灯等目标",
+  "labels": [
+    "person",
+    "car",
+    "bus",
+    "truck",
+    "motorcycle",
+    "traffic_light"
+  ],
+  "input": {
+    "frames_dir": "input/frames"
+  },
+  "output": {
+    "workspace_dir": "workspace"
+  },
+  "pipeline": {
+    "frame_step": 1,
+    "max_frames_per_source": 20,
+    "min_detection_confidence": 0.25,
+    "review_confidence_threshold": 0.8,
+    "include_empty_frames": false,
+    "include_review_queue_in_training": false,
+    "train_split": 0.7,
+    "val_split": 0.2,
+    "test_split": 0.1,
+    "seed": 7
+  },
+  "qwen": {
+    "provider": "mock",
+    "prompt_template": "assets/prompts/qwen3vl_traffic_zh.md",
+    "endpoint": "",
+    "model": "Qwen/Qwen2.5-VL-72B-Instruct",
+    "api_key_env": "QWEN_API_KEY",
+    "timeout_seconds": 60
+  },
+  "yolo": {
+    "detector": "sidecar",
+    "trainer": "mock",
+    "weights": "weights/yolo11n.pt",
+    "image_size": 1280,
+    "epochs": 50
+  }
+}
+
