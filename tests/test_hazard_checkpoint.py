@@ -115,6 +115,27 @@ class SourceSignatureTest(unittest.TestCase):
             video.write_bytes(b"a-much-longer-payload")
             self.assertNotEqual(before, source_signature(source))
 
+    def test_sub_millisecond_mtime_change_is_detected(self) -> None:
+        """回归：mtime 精度必须细于毫秒。
+
+        曾经把 ``st_mtime`` 四舍五入到毫秒，导致同一毫秒内的两次写入被
+        判成"没变"，该失效的断点没失效。这里用显式 utime 设置两个只差
+        1 微秒的时间戳来钉住这个不变量 —— 不依赖文件系统自身的 mtime 精度。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "clip.mp4"
+            video.write_bytes(b"payload")
+            source = KeyframeSource(source_id="v", video_path=video)
+
+            base_ns = 1_700_000_000_000_000_000  # 固定基准，避免依赖当前时间
+            os.utime(video, ns=(base_ns, base_ns))
+            before = source_signature(source)
+
+            os.utime(video, ns=(base_ns + 1_000, base_ns + 1_000))  # +1 微秒
+            after = source_signature(source)
+
+            self.assertNotEqual(before, after)
+
     def test_missing_video_is_still_signable(self) -> None:
         source = KeyframeSource(source_id="v", video_path=Path("/nope/missing.mp4"))
         self.assertTrue(source_signature(source))
@@ -236,7 +257,8 @@ class CheckpointRoundTripTest(unittest.TestCase):
             first.mark_done(source_a, [_record("a", "f_0000.pgm")], {}, [])
             first.mark_done(source_b, [_record("b", "f_0000.pgm")], {}, [])
 
-            # 只改 A 的内容
+            # 只改 A 的内容。刻意保持**同样大小**（256 字节），
+            # 这样只有 mtime 能体现变化 —— 专门盯住 mtime 的精度。
             _write_frames(dir_a, [("f_0000.pgm", bytes([3] * 256))])
 
             second = ExtractionCheckpoint(config)

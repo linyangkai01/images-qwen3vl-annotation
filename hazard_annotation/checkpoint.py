@@ -72,11 +72,18 @@ def config_fingerprint(config: ProjectConfig) -> str:
 
 
 def _file_fingerprint(path: Path) -> dict[str, Any]:
+    """文件指纹：路径 + 大小 + 纳秒级 mtime。
+
+    mtime 用 ``st_mtime_ns``（整数纳秒）而不是 ``st_mtime``：
+    后者是浮点秒，若为了可读性做四舍五入（比如保留到毫秒），
+    在同一毫秒内的连续写入就会被判成"没变"，导致该失效的断点没失效。
+    纳秒整数既精确又没有浮点表示问题。
+    """
     try:
         stat = path.stat()
     except OSError:
         return {"path": str(path), "missing": True}
-    return {"path": str(path), "size": stat.st_size, "mtime": round(stat.st_mtime, 3)}
+    return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
 
 
 def source_signature(source: KeyframeSource) -> str:
