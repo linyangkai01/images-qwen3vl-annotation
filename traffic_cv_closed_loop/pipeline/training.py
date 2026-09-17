@@ -5,6 +5,7 @@ from pathlib import Path
 
 from traffic_cv_closed_loop.adapters.yolo import build_trainer
 from traffic_cv_closed_loop.config import ProjectConfig
+from traffic_cv_closed_loop.dataset_media import materialize_dataset_image
 from traffic_cv_closed_loop.io_utils import copy_file, ensure_dir, read_jsonl, timestamp_token, write_json, write_jsonl, write_text
 from traffic_cv_closed_loop.models import AnnotationRecord
 
@@ -115,11 +116,19 @@ def run_training(config: ProjectConfig, execute_trainer: bool = False) -> dict[s
     class_histogram: dict[str, int] = {}
 
     for split_name, split_records in split_map.items():
+        images_split_dir = dataset_dir / "images" / split_name
+        labels_split_dir = dataset_dir / "labels" / split_name
         for record in split_records:
             relative_path = Path(record.candidate.relative_path)
-            image_target = dataset_dir / "images" / split_name / relative_path
-            label_target = dataset_dir / "labels" / split_name / relative_path.with_suffix(".txt")
-            copy_file(record.candidate.extracted, image_target)
+            # Guarantee a Ultralytics-readable image extension; the label file
+            # is renamed in lock-step so image and label stay paired.
+            image_relative = materialize_dataset_image(
+                record.candidate.extracted,
+                images_split_dir,
+                relative_path,
+            )
+            image_target = images_split_dir / image_relative
+            label_target = labels_split_dir / image_relative.with_suffix(".txt")
             copy_file(Path(record.label_path), label_target)
             for detection in record.qwen_detections:
                 class_histogram[detection.label] = class_histogram.get(detection.label, 0) + 1

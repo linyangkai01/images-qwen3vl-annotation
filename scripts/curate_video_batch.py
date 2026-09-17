@@ -5,6 +5,7 @@ import random
 from pathlib import Path
 
 from traffic_cv_closed_loop.config import ProjectConfig
+from traffic_cv_closed_loop.dataset_media import materialize_dataset_image
 from traffic_cv_closed_loop.io_utils import copy_file, ensure_dir, read_jsonl, write_json, write_text
 from traffic_cv_closed_loop.models import AnnotationRecord
 
@@ -159,11 +160,19 @@ def main() -> int:
     manifest: list[dict[str, object]] = []
     class_histogram: dict[str, int] = {}
     for split_name, split_records in split_map.items():
+        images_split_dir = dataset_dir / "images" / split_name
+        labels_split_dir = dataset_dir / "labels" / split_name
         for record in split_records:
             relative_path = Path(record.candidate.relative_path)
-            image_target = dataset_dir / "images" / split_name / relative_path.name
-            label_target = dataset_dir / "labels" / split_name / relative_path.with_suffix(".txt").name
-            copy_file(record.candidate.extracted, image_target)
+            # Guarantee a Ultralytics-readable image extension; the label file
+            # is renamed in lock-step so image and label stay paired.
+            image_relative = materialize_dataset_image(
+                record.candidate.extracted,
+                images_split_dir,
+                Path(relative_path.name),
+            )
+            image_target = images_split_dir / image_relative
+            label_target = labels_split_dir / image_relative.with_suffix(".txt")
             copy_file(Path(record.label_path), label_target)
             detections = record.qwen_detections or record.candidate.detections
             for detection in detections:
