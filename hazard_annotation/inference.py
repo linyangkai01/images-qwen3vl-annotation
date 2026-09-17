@@ -38,7 +38,12 @@ from traffic_cv_closed_loop.adapters.yolo import (
     UltralyticsDetector,
     build_detector,
 )
-from traffic_cv_closed_loop.config import ProjectConfig
+from traffic_cv_closed_loop.config import (
+    ProjectConfig,
+    endpoint_allowed,
+    endpoint_host_of,
+    is_local_endpoint_host,
+)
 from traffic_cv_closed_loop.io_utils import ensure_dir, write_json
 
 #: 允许的途径取值（与 ``ProjectConfig.validate`` 保持一致）。
@@ -442,9 +447,32 @@ class InferenceRouter:
             "max_video_seconds": self.config.inference_max_video_seconds,
             "on_over_limit": self.config.inference_on_over_limit,
             "segment_seconds": self.config.inference_segment_seconds,
+            "endpoint_policy": {
+                "mode": self.config.inference_endpoint_mode,
+                "allowlist": list(self.config.inference_endpoint_allowlist),
+            },
             "issues": [],
             "notes": [],
         }
+
+        # 端点出网策略：把判定结果显式暴露出来，便于 doctor 审查
+        endpoint = self.config.qwen_chat_endpoint
+        if endpoint:
+            allowed, reason = endpoint_allowed(
+                endpoint,
+                self.config.inference_endpoint_mode,
+                self.config.inference_endpoint_allowlist,
+            )
+            info["endpoint_policy"]["endpoint"] = endpoint
+            info["endpoint_policy"]["allowed"] = allowed
+            info["endpoint_policy"]["reason"] = reason
+            if not allowed:
+                info["issues"].append("endpoint_blocked_by_policy")
+            elif not is_local_endpoint_host(endpoint_host_of(endpoint)):
+                info["notes"].append(
+                    f"端点 {endpoint_host_of(endpoint)} 是公网地址，"
+                    f"已由白名单显式放行；请确认该端点可信且素材可外发"
+                )
 
         if self.path == "private_vlm":
             info["endpoint"] = self.config.qwen_chat_endpoint

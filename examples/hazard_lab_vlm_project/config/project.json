@@ -52,7 +52,16 @@
     "scene_detect_mode": "ffmpeg",
     "max_keyframes": 400,
     "min_gap_seconds": 2.0,
-    "force_keep_labels": ["person", "hook", "rigging", "overhead_crane", "ladder", "scaffold", "harness", "load"]
+    "force_keep_labels": [
+      "person",
+      "hook",
+      "rigging",
+      "overhead_crane",
+      "ladder",
+      "scaffold",
+      "harness",
+      "load"
+    ]
   },
   "knowledge": {
     "kb_path": "",
@@ -86,6 +95,13 @@
       "image_size": 1280,
       "device": "0",
       "timeout_seconds": 1800
+    },
+    "endpoint_policy": {
+      "mode": "allowlist",
+      "allowlist": [
+        "119.23.145.227"
+      ],
+      "_note": "实验室私有 VLM 端点（用户自有部署，已授权）。公网 IP 必须在此显式声明。"
     }
   },
   "qwen": {

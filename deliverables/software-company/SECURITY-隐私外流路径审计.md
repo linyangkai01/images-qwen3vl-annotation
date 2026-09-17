@@ -95,8 +95,57 @@
 
 ## 四、建议措施
 
-**M1【建议优先】加 `base_url` 本地性校验（护栏）**
-默认只允许本机与内网地址（`localhost` / `127.0.0.1` / `::1` / `10.x` / `172.16-31.x` / `192.168.x`）；若配置为公网地址，需显式打开一个开关（如 `qwen.allow_remote=true`）才放行，否则启动即报错。这样"误用云 API"从"改一个字段"变成"必须显式声明"。
+**M1【已实施 · 2026-09-17】加 `base_url` 本地性校验（护栏）**
+
+实施方式：**显式白名单**（比原方案更严格，因为用户已授权一个公网端点）。
+
+配置项：
+
+```json
+"inference": {
+  "endpoint_policy": {
+    "mode": "local_only",
+    "allowlist": []
+  }
+}
+```
+
+三种模式：
+
+- **`local_only`（默认）** —— 只放行本机与内网：`localhost` / `127.0.0.1` / `::1` /
+  `10.x` / `172.16-31.x` / `192.168.x` / `169.254.x` / `*.local` / `*.internal`
+- **`allowlist`** —— 在上述基础上，额外放行 `allowlist` 里逐个声明的主机
+  （支持 `host` 或 `host:port`；写 `host` 表示不限端口）
+- **`any`** —— 不限制（显式放弃护栏，仅用于受控实验）
+
+**判定时机**：配置加载时（`ProjectConfig.validate()`），不在调用时。这样配错的配置**根本加载不起来**。
+
+**报错信息带修复指引**：
+
+```
+端点出网策略拒绝了 http://x.x.x.x:9000：x.x.x.x 不是本机/内网地址，且当前策略为 local_only。
+这是隐私护栏，用于防止真实素材被误发到公网。
+若确需连接该端点，请在配置里显式声明：
+  "inference": {"endpoint_policy": {"mode": "allowlist", "allowlist": ["<host 或 host:port>"]}}
+```
+
+**各配置的声明结果**（已逐个补齐）：
+
+- `examples/hazard_project` —— `local_only`（`localhost:11434`，无需白名单）
+- `examples/hazard_mock_project` / `examples/mock_project` —— 无端点
+- `examples/hazard_lab_vlm_project` —— `allowlist: ["119.23.145.227"]`（实验室私有端点，用户已授权）
+- `examples/production_project` × 2 —— `allowlist: ["ws-qi1jm9l6h7j1j0hl.cn-beijing.maas.aliyuncs.com"]`
+  并附带 `_warning` 字段："阿里云百炼（公网）。禁止用工业真实素材跑此配置。"
+
+**设计取舍**：刻意**不做 DNS 解析**，只做字符串与网段判断。原因是配置加载阶段不应产生网络 I/O——
+否则离线环境加载配置会变慢甚至失败，且解析结果不确定。
+
+**副作用（值得注意）**：Python 的 `ipaddress.is_private` 会把文档保留段
+（`192.0.2.0/24`、`198.51.100.0/24`、`203.0.113.0/24`）也算作"私网"。
+这些段不可公网路由，因此当作本地放行是可接受的；但写测试时**不要拿它们当"公网 IP"的反例**。
+
+**审计可见性**：`InferenceRouter.describe()` 会输出 `endpoint_policy` 的判定结果与原因，
+并在此端点被白名单放行时给出提醒："请确认该端点可信且素材可外发"。
 
 **M2 补 `.gitignore`**
 新增 `examples/hazard_project/input/video/`，并加通用兜底规则 `*.mp4` / `*.mov` / `*.qt` / `*.avi` / `*.jpg` / `*.jpeg` / `*.png` / `*.ppm` / `*.pgm`。

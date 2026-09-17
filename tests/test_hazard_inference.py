@@ -39,6 +39,14 @@ from hazard_annotation.inference import (
     render_probe_report,
     split_duration_segments,
 )
+from traffic_cv_closed_loop.config import (
+    ProjectConfig,
+    endpoint_allowed,
+    endpoint_host_of,
+    endpoint_port_of,
+    is_local_endpoint_host,
+    normalize_allowlist_entry,
+)
 from traffic_cv_closed_loop.adapters.qwen import (
     MockQwenAnnotator,
     PrivateVlmAnnotator,
@@ -517,7 +525,138 @@ class InferenceRouterTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# 6. Endpoint probe (no real material, no live network in tests)
+# 6. Endpoint egress policy (privacy guard)
+# --------------------------------------------------------------------------- #
+class EndpointPolicyTest(unittest.TestCase):
+    """默认只放行本机/内网；公网端点必须在配置里显式声明。
+
+    这层护栏的作用是：让「把真实素材发到公网」从"改一个字段"变成
+    "必须显式写进白名单"，从而留下可审计的痕迹。
+    """
+
+    def test_local_hosts_are_recognised(self) -> None:
+        for host in (
+            "localhost",
+            "127.0.0.1",
+            "::1",
+            "10.0.0.5",
+            "172.16.3.9",
+            "172.31.255.254",
+            "192.168.1.10",
+            "169.254.1.1",
+            "model.local",
+            "svc.internal",
+        ):
+            self.assertTrue(is_local_endpoint_host(host), host)
+
+    def test_public_hosts_are_not_local(self) -> None:
+        for host in (
+            "119.23.145.227",
+            "8.8.8.8",
+            "172.32.0.1",  # 刚好越过私有段上界
+            "172.15.0.1",  # 刚好低于私有段下界
+            "api.openai.com",
+            "dashscope.aliyuncs.com",
+        ):
+            self.assertFalse(is_local_endpoint_host(host), host)
+
+    def test_host_and_port_extraction(self) -> None:
+        self.assertEqual(endpoint_host_of("http://119.23.145.227:38091/api/generate"), "119.23.145.227")
+        self.assertEqual(endpoint_port_of("http://119.23.145.227:38091/api/generate"), 38091)
+        self.assertEqual(endpoint_host_of("https://example.org/v1"), "example.org")
+        self.assertEqual(endpoint_port_of("https://example.org/v1"), 443)
+        self.assertEqual(endpoint_host_of(""), "")
+        self.assertIsNone(endpoint_port_of(""))
+
+    def test_allowlist_entry_normalisation(self) -> None:
+        self.assertEqual(normalize_allowlist_entry("example.org"), ("example.org", None))
+        self.assertEqual(normalize_allowlist_entry("Example.ORG:8080"), ("example.org", 8080))
+        self.assertEqual(
+            normalize_allowlist_entry("http://host.test:9000/x"), ("host.test", 9000)
+        )
+        self.assertEqual(normalize_allowlist_entry("   "), ("", None))
+
+    def test_local_only_allows_local_and_blocks_public(self) -> None:
+        ok, _ = endpoint_allowed("http://localhost:11434/v1", "local_only", [])
+        self.assertTrue(ok)
+        ok, reason = endpoint_allowed("http://119.23.145.227:38091/api/generate", "local_only", [])
+        self.assertFalse(ok)
+        self.assertIn("local_only", reason)
+
+    def test_allowlist_mode_permits_listed_host(self) -> None:
+        ok, _ = endpoint_allowed(
+            "http://119.23.145.227:38091/api/generate",
+            "allowlist",
+            ["119.23.145.227"],
+        )
+        self.assertTrue(ok)
+
+    def test_allowlist_mode_rejects_unlisted_host(self) -> None:
+        ok, reason = endpoint_allowed(
+            "http://119.23.145.227:38091/api/generate",
+            "allowlist",
+            ["other.example.com"],
+        )
+        self.assertFalse(ok)
+        self.assertIn("allowlist", reason)
+
+    def test_allowlist_port_must_match_when_specified(self) -> None:
+        ok, _ = endpoint_allowed("http://host.test:9000/x", "allowlist", ["host.test:9000"])
+        self.assertTrue(ok)
+        ok, _ = endpoint_allowed("http://host.test:9001/x", "allowlist", ["host.test:9000"])
+        self.assertFalse(ok)
+
+    def test_any_mode_permits_everything(self) -> None:
+        ok, _ = endpoint_allowed("http://8.8.8.8/x", "any", [])
+        self.assertTrue(ok)
+
+    def test_empty_endpoint_is_allowed(self) -> None:
+        ok, _ = endpoint_allowed("", "local_only", [])
+        self.assertTrue(ok)
+
+    # -- 通过真实配置验证护栏 ------------------------------------------------ #
+    def test_public_endpoint_without_allowlist_is_rejected(self) -> None:
+        raw = _minimal_raw(
+            qwen={"provider": "private_vlm", "base_url": "http://119.23.145.227:9000"}
+        )
+        with self.assertRaises(ValueError) as ctx:
+            ProjectConfig.load(_write_config(raw))
+        message = str(ctx.exception)
+        self.assertIn("端点出网策略拒绝", message)
+        self.assertIn("endpoint_policy", message)
+
+    def test_public_endpoint_with_allowlist_loads(self) -> None:
+        raw = _minimal_raw(
+            qwen={"provider": "private_vlm", "base_url": "http://119.23.145.227:9000"},
+            inference={
+                "backend": "private_vlm",
+                "endpoint_policy": {"mode": "allowlist", "allowlist": ["119.23.145.227"]},
+            },
+        )
+        config = ProjectConfig.load(_write_config(raw))
+        self.assertEqual(config.inference_endpoint_mode, "allowlist")
+        self.assertEqual(config.inference_endpoint_allowlist, ["119.23.145.227"])
+
+    def test_invalid_policy_mode_rejected(self) -> None:
+        raw = _minimal_raw(inference={"backend": "mock", "endpoint_policy": {"mode": "yolo"}})
+        with self.assertRaises(ValueError):
+            ProjectConfig.load(_write_config(raw))
+
+    def test_shipped_lab_vlm_config_declares_its_allowlist(self) -> None:
+        config = ProjectConfig.load(LAB_VLM_CONFIG)
+        self.assertEqual(config.inference_endpoint_mode, "allowlist")
+        self.assertIn("119.23.145.227", config.inference_endpoint_allowlist)
+
+    def test_shipped_local_config_needs_no_allowlist(self) -> None:
+        config = ProjectConfig.load(
+            ROOT / "examples" / "hazard_project" / "config" / "project.json"
+        )
+        self.assertEqual(config.inference_endpoint_mode, "local_only")
+        self.assertEqual(config.inference_endpoint_allowlist, [])
+
+
+# --------------------------------------------------------------------------- #
+# 7. Endpoint probe (no real material, no live network in tests)
 # --------------------------------------------------------------------------- #
 class EndpointProbeTest(unittest.TestCase):
     def setUp(self) -> None:

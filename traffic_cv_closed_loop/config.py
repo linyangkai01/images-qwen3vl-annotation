@@ -1,10 +1,113 @@
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from traffic_cv_closed_loop.io_utils import read_json
+
+
+# --------------------------------------------------------------------------- #
+# 端点出网策略（隐私护栏）
+#
+# 目的：防止「改一个 base_url 就把真实素材发到公网」。
+# 默认只放行本机与内网；要连公网端点，必须在配置里**逐个显式声明**。
+# 刻意只做字符串/网段判断，不做 DNS 解析 —— 保证配置加载阶段不产生网络 I/O。
+# --------------------------------------------------------------------------- #
+ENDPOINT_POLICY_MODES: tuple[str, ...] = ("local_only", "allowlist", "any")
+
+
+def endpoint_host_of(url: str) -> str:
+    """从端点 URL 里取出主机名；解析不出时返回空串。"""
+    if not url:
+        return ""
+    candidate = url if "://" in url else f"http://{url}"
+    return urlparse(candidate).hostname or ""
+
+
+def endpoint_port_of(url: str) -> int | None:
+    """从端点 URL 里取出端口；未显式指定时按 scheme 推断。"""
+    if not url:
+        return None
+    candidate = url if "://" in url else f"http://{url}"
+    parsed = urlparse(candidate)
+    if parsed.port:
+        return parsed.port
+    if parsed.scheme == "https":
+        return 443
+    if parsed.scheme == "http":
+        return 80
+    return None
+
+
+def is_local_endpoint_host(host: str) -> bool:
+    """判断主机是否属于本机或内网。
+
+    覆盖：``localhost`` / 回环地址 / 私有网段（10.x、172.16-31.x、192.168.x）/
+    链路本地（169.254.x）/ ``.local`` / ``.internal`` 后缀。
+    """
+    if not host:
+        return False
+    normalized = host.strip().strip("[]").lower()
+    if normalized in ("localhost", "::1"):
+        return True
+    if normalized.endswith(".local") or normalized.endswith(".internal"):
+        return True
+    try:
+        address = ipaddress.ip_address(normalized)
+    except ValueError:
+        return False
+    return bool(address.is_loopback or address.is_private or address.is_link_local)
+
+
+def normalize_allowlist_entry(entry: str) -> tuple[str, int | None]:
+    """把白名单条目拆成 ``(host, port)``；``port`` 为 ``None`` 表示不限端口。"""
+    text = entry.strip().lower()
+    if not text:
+        return "", None
+    if "://" in text:
+        return endpoint_host_of(text), endpoint_port_of(text)
+    if text.count(":") == 1:
+        host, _, raw_port = text.partition(":")
+        try:
+            return host, int(raw_port)
+        except ValueError:
+            return text, None
+    return text, None
+
+
+def endpoint_allowed(
+    url: str, mode: str, allowlist: list[str]
+) -> tuple[bool, str]:
+    """判断端点是否被策略放行。
+
+    返回 ``(allowed, reason)``。``reason`` 供报错信息直接引用。
+    """
+    host = endpoint_host_of(url)
+    if not host:
+        # 没有配置端点（如 mock 模式）→ 不涉及出网，直接放行
+        return True, "未配置端点"
+
+    normalized_mode = (mode or "local_only").lower()
+    if normalized_mode == "any":
+        return True, "策略为 any（不做限制）"
+
+    if is_local_endpoint_host(host):
+        return True, f"{host} 属于本机/内网"
+
+    port = endpoint_port_of(url)
+    for entry in allowlist:
+        allowed_host, allowed_port = normalize_allowlist_entry(entry)
+        if allowed_host == host.lower() and allowed_port in (None, port):
+            return True, f"{host} 命中白名单条目 {entry}"
+
+    if normalized_mode == "allowlist":
+        return False, (
+            f"{host} 不在 inference.endpoint_policy.allowlist 中"
+        )
+    return False, f"{host} 不是本机/内网地址，且当前策略为 local_only"
 
 
 def _resolve_path(project_dir: Path, raw_path: str | None, default: str) -> Path:
@@ -346,6 +449,11 @@ class ProjectConfig:
     inference_segment_seconds: float = 55.0
     #: ``inference`` 段的原始字典（供 server_yolo 等读取 server.* 子项）。
     raw_inference: dict[str, Any] = field(default_factory=dict)
+    #: 端点出网策略：``local_only``（默认，仅本机/内网）| ``allowlist``（白名单）| ``any``（不限制）。
+    #: 作用是防止「改一个 base_url 就把真实素材发到公网」。
+    inference_endpoint_mode: str = "local_only"
+    #: ``allowlist`` 模式下的允许主机（``host`` 或 ``host:port``，大小写不敏感）。
+    inference_endpoint_allowlist: list[str] = field(default_factory=list)
 
     @classmethod
     def load(cls, config_path: str | Path) -> "ProjectConfig":
@@ -366,6 +474,9 @@ class ProjectConfig:
         hazard_cfg = raw.get("hazard", {})
         visualization_cfg = raw.get("visualization", {})
         inference_cfg = raw.get("inference", {})
+        endpoint_policy_cfg = (
+            inference_cfg.get("endpoint_policy", {}) if isinstance(inference_cfg, dict) else {}
+        )
 
         train_split = float(pipeline_cfg.get("train_split", 0.7))
         val_split = float(pipeline_cfg.get("val_split", 0.2))
@@ -512,6 +623,12 @@ class ProjectConfig:
             inference_on_over_limit=str(inference_cfg.get("on_over_limit", "warn")),
             inference_segment_seconds=float(inference_cfg.get("segment_seconds", 55.0)),
             raw_inference=_json_dict(inference_cfg),
+            inference_endpoint_mode=str(endpoint_policy_cfg.get("mode", "local_only")),
+            inference_endpoint_allowlist=[
+                str(item)
+                for item in (endpoint_policy_cfg.get("allowlist") or [])
+                if str(item).strip()
+            ],
         )
         config.validate()
         return config
@@ -542,6 +659,25 @@ class ProjectConfig:
         if self.inference_segment_seconds > self.inference_max_video_seconds:
             raise ValueError(
                 "inference.segment_seconds must be <= inference.max_video_seconds"
+            )
+        # --- 端点出网策略：默认只允许本机/内网，公网端点必须显式白名单 ---
+        if self.inference_endpoint_mode not in ENDPOINT_POLICY_MODES:
+            raise ValueError(
+                "inference.endpoint_policy.mode must be one of "
+                + " / ".join(ENDPOINT_POLICY_MODES)
+            )
+        endpoint_ok, endpoint_reason = endpoint_allowed(
+            self.qwen_chat_endpoint,
+            self.inference_endpoint_mode,
+            self.inference_endpoint_allowlist,
+        )
+        if not endpoint_ok:
+            raise ValueError(
+                f"端点出网策略拒绝了 {self.qwen_chat_endpoint}：{endpoint_reason}。\n"
+                "这是隐私护栏，用于防止真实素材被误发到公网。\n"
+                "若确需连接该端点，请在配置里显式声明：\n"
+                '  "inference": {"endpoint_policy": {"mode": "allowlist", '
+                '"allowlist": ["<host 或 host:port>"]}}'
             )
         if self.yolo_epochs <= 0:
             raise ValueError("yolo.epochs must be >= 1")

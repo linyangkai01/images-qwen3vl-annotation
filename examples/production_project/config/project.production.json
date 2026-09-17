@@ -68,5 +68,14 @@
     "resume": false,
     "close_mosaic": 10,
     "save_period": -1
+  },
+  "inference": {
+    "endpoint_policy": {
+      "mode": "allowlist",
+      "allowlist": [
+        "ws-qi1jm9l6h7j1j0hl.cn-beijing.maas.aliyuncs.com"
+      ],
+      "_warning": "阿里云百炼（公网）。禁止用工业真实素材跑此配置。"
+    }
   }
 }
