@@ -15,10 +15,17 @@
 
 1. **配置指纹**（``config_fingerprint``）—— 覆盖所有会影响抽帧结果的配置项。
    改一个 ``motion_min_ratio`` 就必须重算，否则会得到"新旧参数混在一起"的脏数据集。
-2. **数据源指纹**（``source_signature``）—— 覆盖输入本身。
-   刻意**不做全文件哈希**：1 小时视频算 sha256 要几十秒到几分钟，得不偿失。
-   改用「路径 + 大小 + mtime」；对图片目录用「文件名 + 大小 + mtime」的清单哈希。
-   这在工程上足够——内容变了几乎必然伴随大小或 mtime 变化。
+2. **数据源指纹**（``source_signature``）—— 覆盖输入本身，**基于文件内容哈希**。
+
+关于数据源指纹为什么要哈希内容而不是看 mtime —— 这是踩过两次坑的结论：
+
+* 第一次用 ``round(st_mtime, 3)``：同一毫秒内的两次写入检测不到。
+* 改用 ``st_mtime_ns`` 后**在服务器上依然失败** —— 因为 ``/data/users/lyk/.tmp``
+  挂在 **ext2/ext3** 上，**mtime 只有 1 秒粒度**，两次连续写入拿到完全相同的纳秒值。
+
+**只要依赖 mtime，就无法在所有文件系统上正确。** 所以改为 sha256 内容哈希。
+代价可接受：1 小时视频解码要几分钟，而哈希 300MB 只要 1 秒量级。
+顺带一个语义好处：单纯 ``touch`` 不再触发重算（内容没变），这才是"输入是否变化"的正解。
 
 写入一律走「临时文件 + 原子替换」，避免断电/中断留下半截 JSON 把后续重跑带偏。
 """
@@ -71,23 +78,50 @@ def config_fingerprint(config: ProjectConfig) -> str:
     return _sha256_of(json.dumps(relevant, ensure_ascii=False, sort_keys=True, default=str))
 
 
-def _file_fingerprint(path: Path) -> dict[str, Any]:
-    """文件指纹：路径 + 大小 + 纳秒级 mtime。
+def _file_content_digest(path: Path, chunk_size: int = 1 << 20) -> str:
+    """流式计算文件内容的 sha256，分块读避免把大文件整个塞进内存。"""
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            while True:
+                chunk = stream.read(chunk_size)
+                if not chunk:
+                    break
+                digest.update(chunk)
+    except OSError:
+        return "unreadable"
+    return digest.hexdigest()
 
-    mtime 用 ``st_mtime_ns``（整数纳秒）而不是 ``st_mtime``：
-    后者是浮点秒，若为了可读性做四舍五入（比如保留到毫秒），
-    在同一毫秒内的连续写入就会被判成"没变"，导致该失效的断点没失效。
-    纳秒整数既精确又没有浮点表示问题。
+
+def _file_fingerprint(path: Path) -> dict[str, Any]:
+    """文件指纹：路径 + 大小 + **内容哈希**。
+
+    为什么不用 mtime —— 这是踩过坑的结论：
+
+    最初用 ``round(st_mtime, 3)``，同一毫秒内的两次写入检测不到；改用
+    ``st_mtime_ns`` 后**在服务器上依然失败**，因为 ``/data/users/lyk/.tmp``
+    是 **ext2/ext3 文件系统，mtime 只有 1 秒粒度** —— 两次连续写入拿到的是
+    完全相同的纳秒时间戳。
+
+    结论：**只要依赖 mtime，就无法在所有文件系统上正确**。所以改为对内容做
+    sha256。代价可接受：1 小时视频解码要几分钟，而哈希 300MB 只要 1 秒量级。
+
+    顺带一个语义上的好处：单纯 ``touch`` 文件不再触发重算，因为内容没变 ——
+    这才是"输入是否变化"的正确含义。
     """
     try:
         stat = path.stat()
     except OSError:
         return {"path": str(path), "missing": True}
-    return {"path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    return {
+        "path": str(path),
+        "size": stat.st_size,
+        "sha256": _file_content_digest(path),
+    }
 
 
 def source_signature(source: KeyframeSource) -> str:
-    """给一个输入源算指纹；内容变了指纹就变。"""
+    """给一个输入源算指纹；**内容**变了指纹就变。"""
     if source.video_path is not None:
         payload: dict[str, Any] = {
             "kind": "video",

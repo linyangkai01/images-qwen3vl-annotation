@@ -97,14 +97,24 @@ class ConfigFingerprintTest(unittest.TestCase):
 
 
 class SourceSignatureTest(unittest.TestCase):
-    def test_video_signature_changes_with_mtime(self) -> None:
+    def test_video_signature_changes_with_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             video = Path(tmp) / "clip.mp4"
             video.write_bytes(b"fake-video-bytes")
             source = KeyframeSource(source_id="v", video_path=video)
             before = source_signature(source)
-            os.utime(video, (time.time() + 60, time.time() + 60))
+            video.write_bytes(b"different-content!")
             self.assertNotEqual(before, source_signature(source))
+
+    def test_touching_a_file_does_not_invalidate(self) -> None:
+        """单纯 touch（内容未变）不应触发重算 —— 这才是"输入是否变化"的正解。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "clip.mp4"
+            video.write_bytes(b"stable-content")
+            source = KeyframeSource(source_id="v", video_path=video)
+            before = source_signature(source)
+            os.utime(video, (time.time() + 3600, time.time() + 3600))
+            self.assertEqual(before, source_signature(source))
 
     def test_video_signature_changes_with_size(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -115,26 +125,20 @@ class SourceSignatureTest(unittest.TestCase):
             video.write_bytes(b"a-much-longer-payload")
             self.assertNotEqual(before, source_signature(source))
 
-    def test_sub_millisecond_mtime_change_is_detected(self) -> None:
-        """回归：mtime 精度必须细于毫秒。
+    def test_same_size_content_change_is_detected(self) -> None:
+        """回归：同大小、不同内容的改动必须被检测到。
 
-        曾经把 ``st_mtime`` 四舍五入到毫秒，导致同一毫秒内的两次写入被
-        判成"没变"，该失效的断点没失效。这里用显式 utime 设置两个只差
-        1 微秒的时间戳来钉住这个不变量 —— 不依赖文件系统自身的 mtime 精度。
+        这条盯的是「不能依赖 mtime」这个不变量。服务器上 ``/data/users/lyk/.tmp``
+        是 ext2/ext3，**mtime 只有 1 秒粒度** —— 同秒内改写会拿到完全相同的
+        时间戳（连纳秒值都一样），只有内容哈希才能可靠发现。
         """
         with tempfile.TemporaryDirectory() as tmp:
             video = Path(tmp) / "clip.mp4"
-            video.write_bytes(b"payload")
+            video.write_bytes(b"AAAAAAAA")
             source = KeyframeSource(source_id="v", video_path=video)
-
-            base_ns = 1_700_000_000_000_000_000  # 固定基准，避免依赖当前时间
-            os.utime(video, ns=(base_ns, base_ns))
             before = source_signature(source)
-
-            os.utime(video, ns=(base_ns + 1_000, base_ns + 1_000))  # +1 微秒
-            after = source_signature(source)
-
-            self.assertNotEqual(before, after)
+            video.write_bytes(b"BBBBBBBB")  # 同长度，不同内容
+            self.assertNotEqual(before, source_signature(source))
 
     def test_missing_video_is_still_signable(self) -> None:
         source = KeyframeSource(source_id="v", video_path=Path("/nope/missing.mp4"))
