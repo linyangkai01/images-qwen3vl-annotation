@@ -479,16 +479,23 @@ class InferenceRouter:
             info["model"] = self.config.qwen_model
             info["images_mode"] = self.config.qwen_images_mode
             info["auth_env"] = self.config.qwen_api_key_env
+            key_file = getattr(self.config, "qwen_api_key_file", "") or ""
+            info["auth_file"] = key_file
             import os
 
-            token = os.environ.get(self.config.qwen_api_key_env, "")
-            info["auth_token_present"] = bool(token)
+            env_token = os.environ.get(self.config.qwen_api_key_env, "").strip()
+            file_ready = bool(key_file) and Path(key_file).exists()
+            info["auth_token_present"] = bool(env_token) or file_ready
+            info["auth_token_source"] = (
+                "env" if env_token else ("file" if file_ready else "none")
+            )
             if not self.config.qwen_chat_endpoint:
                 info["issues"].append("private_vlm_base_url_missing")
-            if not token:
+            if not info["auth_token_present"]:
                 info["issues"].append(f"auth_token_missing:{self.config.qwen_api_key_env}")
                 info["notes"].append(
-                    f"请设置环境变量 {self.config.qwen_api_key_env}=<Bearer Token>"
+                    f"请设置环境变量 {self.config.qwen_api_key_env}=<Bearer Token>，"
+                    f"或把 token 写入文件并在配置里指定 qwen.api_key_file"
                 )
         elif self.path == "server_yolo":
             settings = build_remote_yolo_settings(self.config)
@@ -651,13 +658,20 @@ def probe_inference_endpoint(
     import os
 
     endpoint = config.qwen_chat_endpoint
+    key_file = getattr(config, "qwen_api_key_file", "") or ""
+    env_token = os.environ.get(config.qwen_api_key_env, "").strip()
+    file_ready = bool(key_file) and Path(key_file).exists()
+    token_present = bool(env_token) or file_ready
+
     report: dict[str, Any] = {
         "backend": config.inference_backend,
         "endpoint": endpoint,
         "model": config.qwen_model,
         "images_mode": config.qwen_images_mode,
         "auth_env": config.qwen_api_key_env,
-        "auth_token_present": bool(os.environ.get(config.qwen_api_key_env, "")),
+        "auth_file": key_file,
+        "auth_token_present": token_present,
+        "auth_token_source": "env" if env_token else ("file" if file_ready else "none"),
         "layers": {},
         "warnings": [],
         "issues": [],
@@ -678,7 +692,8 @@ def probe_inference_endpoint(
     if not report["auth_token_present"]:
         report["issues"].append(f"auth_token_missing:{config.qwen_api_key_env}")
         report["warnings"].append(
-            f"未设置环境变量 {config.qwen_api_key_env}，无法做带认证的真实请求"
+            f"未设置环境变量 {config.qwen_api_key_env}，也未找到可用的 token 文件，"
+            f"无法做带认证的真实请求"
         )
 
     if send_request:
@@ -762,15 +777,22 @@ def _render_probe_verdict(report: dict[str, Any]) -> str:
 def render_probe_report(report: dict[str, Any]) -> str:
     """把探测报告渲染成便于阅读的多行文本。"""
     layers = report["layers"]
+    source_label = {
+        "env": "环境变量",
+        "file": "token 文件",
+        "none": "未配置",
+    }.get(report.get("auth_token_source", "none"), "未配置")
     lines = [
         "=== 私有 VLM 端点探测 ===",
         f"  途径      : {report['backend']}",
         f"  端点      : {report['endpoint']}",
         f"  模型      : {report['model']}",
         f"  images    : {report['images_mode']}",
-        f"  token 环境 : {report['auth_env']}（{'已设置' if report['auth_token_present'] else '未设置'}）",
-        "",
+        f"  token     : {source_label}（环境变量 {report['auth_env']}）",
     ]
+    if report.get("auth_file"):
+        lines.append(f"  token 文件 : {report['auth_file']}")
+    lines.append("")
     tcp = layers.get("tcp", {})
     if tcp:
         state = "可连接" if tcp.get("reachable") else "不可连接"

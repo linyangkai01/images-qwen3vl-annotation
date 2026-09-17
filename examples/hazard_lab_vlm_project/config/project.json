@@ -112,6 +112,7 @@
     "prompt_template": "assets/prompts/combined_zh.md",
     "model": "qwen3-vl:30b-a3b-thinking-q8_0",
     "api_key_env": "LAB_VLM_TOKEN",
+    "api_key_file": "token.txt",
     "require_api_key": true,
     "timeout_seconds": 600,
     "max_retries": 2,

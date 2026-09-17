@@ -283,7 +283,141 @@ class PrivateVlmPayloadTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# 3. Remote (lab-server) YOLO delegation
+# 3. Token resolution: env var first, then token file
+# --------------------------------------------------------------------------- #
+class TokenResolutionTest(unittest.TestCase):
+    """token 的两种来源：环境变量优先，取不到时回退到 token 文件。
+
+    为什么要有文件方式：环境变量**不跨进程/终端共享**。用户在自己的终端里
+    ``export``，而探测、标注、训练各自是独立进程，看不到那个变量。文件方式
+    没有这个问题，且天然落在 .gitignore 覆盖范围内。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self.tmp.name) / "proj"
+        (self.project / "config").mkdir(parents=True, exist_ok=True)
+        (self.project / "input" / "frames").mkdir(parents=True, exist_ok=True)
+        os.environ.pop("LAB_VLM_TOKEN", None)
+
+    def tearDown(self) -> None:
+        os.environ.pop("LAB_VLM_TOKEN", None)
+        self.tmp.cleanup()
+
+    def _config(self, api_key_file: str | None = None) -> ProjectConfig:
+        raw = json.loads(LAB_VLM_CONFIG.read_text(encoding="utf-8"))
+        if api_key_file is None:
+            raw["qwen"].pop("api_key_file", None)
+        else:
+            raw["qwen"]["api_key_file"] = api_key_file
+        (self.project / "config" / "project.json").write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+        )
+        return ProjectConfig.load(self.project / "config" / "project.json")
+
+    def test_api_key_file_resolves_relative_to_project(self) -> None:
+        config = self._config("token.txt")
+        self.assertEqual(Path(config.qwen_api_key_file), self.project / "token.txt")
+
+    def test_no_api_key_file_leaves_it_empty(self) -> None:
+        config = self._config(None)
+        self.assertEqual(config.qwen_api_key_file, "")
+
+    def test_token_read_from_file(self) -> None:
+        (self.project / "token.txt").write_text("file-token-abc\n", encoding="utf-8")
+        annotator = build_qwen_annotator(self._config("token.txt"))
+        headers = annotator._build_headers()
+        self.assertEqual(headers["Authorization"], "Bearer file-token-abc")
+
+    def test_environment_variable_takes_priority(self) -> None:
+        (self.project / "token.txt").write_text("file-token\n", encoding="utf-8")
+        os.environ["LAB_VLM_TOKEN"] = "env-token"
+        try:
+            annotator = build_qwen_annotator(self._config("token.txt"))
+            headers = annotator._build_headers()
+        finally:
+            os.environ.pop("LAB_VLM_TOKEN", None)
+        self.assertEqual(headers["Authorization"], "Bearer env-token")
+
+    def test_first_non_empty_line_wins(self) -> None:
+        (self.project / "token.txt").write_text(
+            "\n\n   real-token   \nsecond-line\n", encoding="utf-8"
+        )
+        annotator = build_qwen_annotator(self._config("token.txt"))
+        headers = annotator._build_headers()
+        self.assertEqual(headers["Authorization"], "Bearer real-token")
+
+    def test_missing_token_file_raises_with_path(self) -> None:
+        annotator = build_qwen_annotator(self._config("nope.txt"))
+        with self.assertRaises(ValueError) as ctx:
+            annotator._build_headers()
+        message = str(ctx.exception)
+        self.assertIn("token 文件也不存在", message)
+        self.assertIn("nope.txt", message)
+        # 报错要同时给出两种可行的配置方式
+        self.assertIn("LAB_VLM_TOKEN", message)
+
+    def test_empty_token_file_raises(self) -> None:
+        (self.project / "token.txt").write_text("\n\n   \n", encoding="utf-8")
+        annotator = build_qwen_annotator(self._config("token.txt"))
+        with self.assertRaises(ValueError) as ctx:
+            annotator._build_headers()
+        self.assertIn("token 文件是空的", str(ctx.exception))
+
+    def test_error_mentions_both_sources(self) -> None:
+        # 配了 api_key_file 但文件不存在 → 报错要点出文件路径与替代方案
+        annotator = build_qwen_annotator(self._config("token.txt"))
+        with self.assertRaises(ValueError) as ctx:
+            annotator._build_headers()
+        message = str(ctx.exception)
+        self.assertIn("token 文件也不存在", message)
+        self.assertIn("LAB_VLM_TOKEN", message)
+
+        # 没配 api_key_file → 报错要同时给出环境变量与文件两种配置方式
+        annotator2 = build_qwen_annotator(self._config(None))
+        with self.assertRaises(ValueError) as ctx2:
+            annotator2._build_headers()
+        message2 = str(ctx2.exception)
+        self.assertIn("LAB_VLM_TOKEN", message2)
+        self.assertIn("api_key_file", message2)
+
+    def test_describe_reports_token_source(self) -> None:
+        (self.project / "token.txt").write_text("file-token\n", encoding="utf-8")
+        info = InferenceRouter(self._config("token.txt")).describe()
+        self.assertTrue(info["auth_token_present"])
+        self.assertEqual(info["auth_token_source"], "file")
+
+    def test_describe_reports_env_source(self) -> None:
+        os.environ["LAB_VLM_TOKEN"] = "env-token"
+        try:
+            info = InferenceRouter(self._config(None)).describe()
+        finally:
+            os.environ.pop("LAB_VLM_TOKEN", None)
+        self.assertTrue(info["auth_token_present"])
+        self.assertEqual(info["auth_token_source"], "env")
+
+    def test_describe_reports_none_when_unconfigured(self) -> None:
+        info = InferenceRouter(self._config(None)).describe()
+        self.assertFalse(info["auth_token_present"])
+        self.assertEqual(info["auth_token_source"], "none")
+
+    def test_probe_accepts_token_from_file(self) -> None:
+        (self.project / "token.txt").write_text("file-token\n", encoding="utf-8")
+        config = self._config("token.txt")
+        with mock.patch.object(
+            inference_module, "probe_tcp", return_value={"reachable": True, "elapsed_ms": 1.0}
+        ), mock.patch.object(
+            inference_module,
+            "probe_http_status",
+            return_value={"status_code": 403, "auth_enforced": True},
+        ):
+            report = probe_inference_endpoint(config)
+        self.assertTrue(report["auth_token_present"])
+        self.assertEqual(report["auth_token_source"], "file")
+
+
+# --------------------------------------------------------------------------- #
+# 4. Remote (lab-server) YOLO delegation
 # --------------------------------------------------------------------------- #
 class RemoteYoloTest(unittest.TestCase):
     def setUp(self) -> None:

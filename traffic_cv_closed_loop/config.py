@@ -388,6 +388,9 @@ class ProjectConfig:
     qwen_request_path: str
     qwen_model: str
     qwen_api_key_env: str
+    #: 存放 token 的文件路径（环境变量取不到时的回退）。
+    #: 比环境变量更稳：环境变量不跨进程/终端共享，而探测、标注、训练各自独立进程。
+    qwen_api_key_file: str
     qwen_require_api_key: bool
     qwen_timeout_seconds: int
     qwen_max_retries: int
@@ -558,6 +561,11 @@ class ProjectConfig:
             qwen_endpoint=str(qwen_cfg.get("endpoint", "") or ""),
             qwen_request_path=str(qwen_cfg.get("request_path", "/chat/completions")),
             qwen_model=str(qwen_cfg.get("model", "Qwen/Qwen2.5-VL-72B-Instruct")),
+            qwen_api_key_file=str(
+                _resolve_path(project_dir, qwen_cfg.get("api_key_file"), "")
+            )
+            if qwen_cfg.get("api_key_file")
+            else "",
             qwen_api_key_env=str(
                 qwen_cfg.get(
                     "api_key_env",

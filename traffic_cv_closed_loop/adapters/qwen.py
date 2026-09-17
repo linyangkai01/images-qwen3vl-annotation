@@ -439,16 +439,56 @@ class OpenAICompatibleQwenAnnotator:
     def provider_label(self) -> str:
         return "local_openai" if self.config.qwen_provider.lower() == "local_openai" else "openai_compatible"
 
+    def _resolve_api_key(self) -> str:
+        """按「环境变量 → token 文件」的顺序取 token。
+
+        环境变量优先（CI/容器里更自然）；拿不到时回退到 ``qwen.api_key_file``。
+        文件方式更稳：环境变量在不同进程/终端之间不共享，而探测、标注、
+        训练往往是各自独立的进程。
+
+        文件读取只取**第一个非空行**并去掉首尾空白，这样用
+        ``echo <token> > token.txt`` 或手写带换行的文件都能用。
+        """
+        api_key = os.environ.get(self.config.qwen_api_key_env, "").strip()
+        if api_key:
+            return api_key
+
+        key_file = getattr(self.config, "qwen_api_key_file", "") or ""
+        if key_file:
+            path = Path(key_file)
+            if not path.exists():
+                raise ValueError(
+                    f"缺少 API token：环境变量 {self.config.qwen_api_key_env} 未设置，"
+                    f"token 文件也不存在：{path}（配置项 qwen.api_key_file）。\n"
+                    f"二选一即可：\n"
+                    f"  1) 设置环境变量 {self.config.qwen_api_key_env}=<Bearer Token>\n"
+                    f"  2) 把 token 写进文件 {path}（首行非空内容即可）"
+                )
+            for raw_line in path.read_text(encoding="utf-8").splitlines():
+                candidate = raw_line.strip()
+                if candidate:
+                    return candidate
+            raise ValueError(
+                f"缺少 API token：token 文件是空的：{path}（配置项 qwen.api_key_file）。\n"
+                f"请把 token 写入该文件的首行，或改用环境变量 {self.config.qwen_api_key_env}"
+            )
+        return ""
+
     def _build_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
         headers.update(self.config.qwen_headers)
 
-        api_key = os.environ.get(self.config.qwen_api_key_env, "")
+        api_key = self._resolve_api_key()
         if api_key:
             headers["Authorization"] = f"{self.config.qwen_auth_scheme} {api_key}".strip()
         elif self.config.qwen_require_api_key:
+            sources = [f"环境变量 {self.config.qwen_api_key_env}"]
+            if getattr(self.config, "qwen_api_key_file", ""):
+                sources.append(f"token 文件 {self.config.qwen_api_key_file}")
             raise ValueError(
-                f"Missing required API key in environment variable {self.config.qwen_api_key_env}"
+                "缺少必需的 API token，已尝试：" + " 与 ".join(sources) + "。"
+                f"请设置环境变量 {self.config.qwen_api_key_env}=<Bearer Token>，"
+                f"或在配置里指定 qwen.api_key_file 指向一个存放 token 的文件。"
             )
 
         for header_name, env_name in self.config.qwen_header_env.items():
