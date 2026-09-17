@@ -19,7 +19,9 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from hazard_annotation import inference as inference_module
 from hazard_annotation.inference import (
     INFERENCE_BACKENDS,
     InferenceConfigError,
@@ -28,8 +30,13 @@ from hazard_annotation.inference import (
     RemoteYoloSettings,
     VideoDurationError,
     build_inference_router,
+    build_synthetic_probe_image,
     check_video_duration,
+    parse_endpoint,
+    probe_inference_endpoint,
+    probe_tcp,
     render_duration_notice,
+    render_probe_report,
     split_duration_segments,
 )
 from traffic_cv_closed_loop.adapters.qwen import (
@@ -507,6 +514,108 @@ class InferenceRouterTest(unittest.TestCase):
             router.write_report(target)
             payload = json.loads(target.read_text(encoding="utf-8"))
         self.assertEqual(payload["backend"], "private_vlm")
+
+
+# --------------------------------------------------------------------------- #
+# 6. Endpoint probe (no real material, no live network in tests)
+# --------------------------------------------------------------------------- #
+class EndpointProbeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.config = ProjectConfig.load(LAB_VLM_CONFIG)
+        os.environ.pop("LAB_VLM_TOKEN", None)
+
+    def test_parse_endpoint_with_explicit_port(self) -> None:
+        self.assertEqual(
+            parse_endpoint("http://119.23.145.227:38091/api/generate"),
+            ("119.23.145.227", 38091),
+        )
+
+    def test_parse_endpoint_defaults(self) -> None:
+        self.assertEqual(parse_endpoint("http://localhost/v1"), ("localhost", 80))
+        self.assertEqual(parse_endpoint("https://example.org/x"), ("example.org", 443))
+
+    def test_synthetic_probe_image_is_a_real_png(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "probe" / "synthetic.png"
+            result = build_synthetic_probe_image(target)
+            payload = result.read_bytes()
+        self.assertEqual(result, target)
+        self.assertTrue(payload.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertGreater(len(payload), 500)
+
+    def test_probe_tcp_reports_unreachable_without_raising(self) -> None:
+        # port 1 on localhost should refuse immediately; no external traffic
+        result = probe_tcp("127.0.0.1", 1, timeout=2.0)
+        self.assertFalse(result["reachable"])
+        self.assertIn("error", result)
+
+    def test_missing_endpoint_is_reported_not_raised(self) -> None:
+        self.config.qwen_base_url = ""
+        self.config.qwen_endpoint = ""
+        report = probe_inference_endpoint(self.config)
+        self.assertIn("endpoint_missing", report["issues"])
+        self.assertIn("配置缺失", report["verdict"])
+
+    def test_probe_flags_missing_token(self) -> None:
+        with mock.patch.object(inference_module, "probe_tcp", return_value={"reachable": True, "elapsed_ms": 1.0}), \
+             mock.patch.object(
+                 inference_module,
+                 "probe_http_status",
+                 return_value={"status_code": 403, "auth_enforced": True},
+             ):
+            report = probe_inference_endpoint(self.config)
+        self.assertFalse(report["auth_token_present"])
+        self.assertTrue(any("auth_token_missing" in i for i in report["issues"]))
+        self.assertIn("token 未设置", report["verdict"])
+
+    def test_probe_verdict_when_reachable_and_token_present(self) -> None:
+        os.environ["LAB_VLM_TOKEN"] = "abc"
+        try:
+            with mock.patch.object(inference_module, "probe_tcp", return_value={"reachable": True, "elapsed_ms": 1.0}), \
+                 mock.patch.object(
+                     inference_module,
+                     "probe_http_status",
+                     return_value={"status_code": 403, "auth_enforced": True},
+                 ):
+                report = probe_inference_endpoint(self.config)
+        finally:
+            os.environ.pop("LAB_VLM_TOKEN", None)
+        self.assertTrue(report["auth_token_present"])
+        self.assertIn("可发真实请求", report["verdict"])
+
+    def test_probe_verdict_when_unreachable(self) -> None:
+        with mock.patch.object(
+            inference_module, "probe_tcp", return_value={"reachable": False, "error": "timeout"}
+        ), mock.patch.object(
+            inference_module, "probe_http_status", return_value={"status_code": None}
+        ):
+            report = probe_inference_endpoint(self.config)
+        self.assertIn("不可达", report["verdict"])
+
+    def test_send_request_without_token_does_not_call_the_model(self) -> None:
+        with mock.patch.object(inference_module, "probe_tcp", return_value={"reachable": True, "elapsed_ms": 1.0}), \
+             mock.patch.object(
+                 inference_module,
+                 "probe_http_status",
+                 return_value={"status_code": 403, "auth_enforced": True},
+             ):
+            report = probe_inference_endpoint(self.config, send_request=True)
+        self.assertIn("cannot_send_request_without_token", report["issues"])
+        self.assertNotIn("request", report["layers"])
+
+    def test_render_probe_report_lists_all_three_layers(self) -> None:
+        with mock.patch.object(inference_module, "probe_tcp", return_value={"reachable": True, "elapsed_ms": 1.0}), \
+             mock.patch.object(
+                 inference_module,
+                 "probe_http_status",
+                 return_value={"status_code": 403, "auth_enforced": True},
+             ):
+            report = probe_inference_endpoint(self.config)
+        text = render_probe_report(report)
+        self.assertIn("[1/3]", text)
+        self.assertIn("[2/3]", text)
+        self.assertIn("[3/3]", text)
+        self.assertIn("强制鉴权", text)
 
 
 if __name__ == "__main__":

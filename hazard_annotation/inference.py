@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -509,3 +510,270 @@ def render_duration_notice(report: VideoDurationReport) -> str:
     if report.action == "warn":
         return f"[时长校验] 告警：{report.message}"
     return f"[时长校验] 拒绝：{report.message}"
+
+
+# --------------------------------------------------------------------------- #
+# 连通性探测（不发送任何真实素材）
+# --------------------------------------------------------------------------- #
+def parse_endpoint(url: str) -> tuple[str, int]:
+    """从 ``http://host:port/path`` 里拆出 ``(host, port)``。"""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url if "://" in url else f"http://{url}")
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return host, port
+
+
+def probe_tcp(host: str, port: int, timeout: float = 8.0) -> dict[str, Any]:
+    """只做 TCP 握手，不发送任何业务数据。"""
+    import socket
+
+    started = time.perf_counter()
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+            return {"reachable": True, "elapsed_ms": elapsed_ms}
+    except OSError as error:
+        elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
+        return {"reachable": False, "elapsed_ms": elapsed_ms, "error": str(error)}
+
+
+def probe_http_status(url: str, timeout: float = 8.0) -> dict[str, Any]:
+    """发一个不带凭据、不带图片的 GET，看服务是否在线以及是否强制鉴权。
+
+    403/401 是好信号：说明服务在线且认证层在工作。
+    """
+    import urllib.error
+    import urllib.request
+
+    started = time.perf_counter()
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            status = response.status
+            body = response.read(200)
+        return {
+            "status_code": status,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+            "body_preview": body.decode("utf-8", errors="replace")[:120],
+        }
+    except urllib.error.HTTPError as error:
+        return {
+            "status_code": error.code,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+            "auth_enforced": error.code in (401, 403),
+            "body_preview": error.read(200).decode("utf-8", errors="replace")[:120],
+        }
+    except Exception as error:  # noqa: BLE001 - 探测失败要作为数据返回
+        return {
+            "status_code": None,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+            "error": str(error),
+        }
+
+
+def build_synthetic_probe_image(path: str | Path) -> Path:
+    """在本地合成一张测试图，**不读取任何真实素材**。
+
+    画面上有明确的可描述内容（几个色块 + 一个近似人形的矩形），
+    便于人工判断模型是否真的"看到了"图片，而不是在编造。
+    """
+    from hazard_annotation.imageio import encode_png
+
+    width, height = 160, 120
+    pixels = bytearray()
+    for y in range(height):
+        for x in range(width):
+            # 背景：蓝灰渐变
+            r = 40 + int(60 * x / width)
+            g = 50 + int(60 * y / height)
+            b = 70
+            # 左下方：一个"人形"浅色矩形
+            if 20 <= x < 45 and 60 <= y < 110:
+                r, g, b = 220, 210, 190
+            # 中部：一个橙色"吊钩"方块
+            if 80 <= x < 110 and 30 <= y < 55:
+                r, g, b = 230, 140, 40
+            # 右下方：一个灰色"吊物"方块
+            if 115 <= x < 150 and 75 <= y < 105:
+                r, g, b = 150, 150, 155
+            pixels.extend((r, g, b))
+
+    target = Path(path)
+    ensure_dir(target.parent)
+    target.write_bytes(encode_png(width, height, bytes(pixels)))
+    return target
+
+
+def probe_inference_endpoint(
+    config: ProjectConfig,
+    image_path: str | Path | None = None,
+    send_request: bool = False,
+) -> dict[str, Any]:
+    """分层探测私有 VLM 端点。
+
+    三层，逐层加深，**任一层失败都返回结构化结果而不是抛异常**：
+
+    1. TCP 握手 —— 不发送任何数据
+    2. 无凭据 GET —— 看服务是否在线、是否强制鉴权
+    3. 可选：带合成图的一次真实请求（``send_request=True``，需 token）
+
+    第 3 层默认关闭；即便开启，用的也是本地合成的图，**不涉及任何真实素材**。
+    """
+    import os
+
+    endpoint = config.qwen_chat_endpoint
+    report: dict[str, Any] = {
+        "backend": config.inference_backend,
+        "endpoint": endpoint,
+        "model": config.qwen_model,
+        "images_mode": config.qwen_images_mode,
+        "auth_env": config.qwen_api_key_env,
+        "auth_token_present": bool(os.environ.get(config.qwen_api_key_env, "")),
+        "layers": {},
+        "warnings": [],
+        "issues": [],
+    }
+
+    if not endpoint:
+        report["issues"].append("endpoint_missing")
+        report["verdict"] = "配置缺失：qwen.base_url 或 qwen.endpoint 未设置"
+        return report
+
+    host, port = parse_endpoint(endpoint)
+    report["layers"]["tcp"] = probe_tcp(host, port)
+
+    # 无凭据 GET 根路径：探活 + 看鉴权是否强制
+    root_url = f"{'https' if port == 443 else 'http'}://{host}:{port}/"
+    report["layers"]["http_anonymous"] = probe_http_status(root_url)
+
+    if not report["auth_token_present"]:
+        report["issues"].append(f"auth_token_missing:{config.qwen_api_key_env}")
+        report["warnings"].append(
+            f"未设置环境变量 {config.qwen_api_key_env}，无法做带认证的真实请求"
+        )
+
+    if send_request:
+        if not report["auth_token_present"]:
+            report["issues"].append("cannot_send_request_without_token")
+        else:
+            target = (
+                Path(image_path)
+                if image_path
+                else build_synthetic_probe_image(
+                    Path(config.workspace_dir) / "probe" / "synthetic_probe.png"
+                )
+            )
+            report["layers"]["request"] = _probe_real_request(config, target)
+
+    report["verdict"] = _render_probe_verdict(report)
+    return report
+
+
+def _probe_real_request(config: ProjectConfig, image_path: Path) -> dict[str, Any]:
+    """发一次真实请求（用合成图），把异常转成数据返回。"""
+    from traffic_cv_closed_loop.models import CandidateFrame
+
+    annotator = build_qwen_annotator(config)
+    candidate = CandidateFrame(
+        source_id="probe",
+        relative_path=image_path.name,
+        original_path=str(image_path.resolve()),
+        extracted_path=str(image_path.resolve()),
+        detections=[],
+        scene=config.scene,
+        metadata={"probe": True, "synthetic": True},
+    )
+    prompt = (
+        "这是一张用于连通性测试的合成图片。请只输出 JSON，"
+        '格式为 {"objects": [], "hazard_report": {"scene_type": "无", '
+        '"hazards": [], "overall_risk": "none", "recommendation": ""}}。'
+        "不需要真的识别隐患。"
+    )
+    started = time.perf_counter()
+    try:
+        objects, hazard_report, payload = annotator.annotate_combined(candidate, prompt)
+        return {
+            "ok": True,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+            "image": str(image_path),
+            "synthetic": True,
+            "object_count": len(objects),
+            "overall_risk": hazard_report.get("overall_risk"),
+            "provider": payload.get("provider"),
+            "raw_response_preview": str(payload.get("response", ""))[:200],
+        }
+    except Exception as error:  # noqa: BLE001 - 探测失败即数据
+        return {
+            "ok": False,
+            "elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+            "image": str(image_path),
+            "synthetic": True,
+            "error": f"{type(error).__name__}: {error}",
+        }
+
+
+def _render_probe_verdict(report: dict[str, Any]) -> str:
+    layers = report["layers"]
+    tcp = layers.get("tcp", {})
+    http = layers.get("http_anonymous", {})
+
+    if not tcp.get("reachable"):
+        return f"不可达：TCP {report['endpoint']} 连接失败"
+    if http.get("auth_enforced"):
+        if report["auth_token_present"]:
+            return "服务在线且强制鉴权；token 已就位，可发真实请求"
+        return "服务在线且强制鉴权；但 token 未设置，带认证的请求还发不了"
+    if http.get("status_code") == 200:
+        return "服务在线；未强制鉴权（可能不需要 token）"
+    if http.get("status_code") is None:
+        return f"TCP 可达但 HTTP 探测失败：{http.get('error', '未知原因')}"
+    return f"TCP 可达；HTTP 返回 {http['status_code']}"
+
+
+def render_probe_report(report: dict[str, Any]) -> str:
+    """把探测报告渲染成便于阅读的多行文本。"""
+    layers = report["layers"]
+    lines = [
+        "=== 私有 VLM 端点探测 ===",
+        f"  途径      : {report['backend']}",
+        f"  端点      : {report['endpoint']}",
+        f"  模型      : {report['model']}",
+        f"  images    : {report['images_mode']}",
+        f"  token 环境 : {report['auth_env']}（{'已设置' if report['auth_token_present'] else '未设置'}）",
+        "",
+    ]
+    tcp = layers.get("tcp", {})
+    if tcp:
+        state = "可连接" if tcp.get("reachable") else "不可连接"
+        extra = f"（{tcp.get('elapsed_ms')}ms）" if tcp.get("reachable") else f"（{tcp.get('error')}）"
+        lines.append(f"  [1/3] TCP 握手      : {state}{extra}")
+    http = layers.get("http_anonymous", {})
+    if http:
+        code = http.get("status_code")
+        note = "（强制鉴权，正常）" if http.get("auth_enforced") else ""
+        lines.append(f"  [2/3] 无凭据 GET    : HTTP {code}{note}")
+    req = layers.get("request")
+    if req:
+        if req.get("ok"):
+            lines.append(
+                f"  [3/3] 合成图请求    : 成功（{req['elapsed_ms']}ms，"
+                f"检出 {req['object_count']} 个目标，overall_risk={req['overall_risk']}）"
+            )
+        else:
+            lines.append(f"  [3/3] 合成图请求    : 失败（{req.get('error')}）")
+    else:
+        lines.append("  [3/3] 合成图请求    : 未执行（加 --send-request 可执行）")
+
+    if report["issues"]:
+        lines.append("")
+        lines.append("  待处理：")
+        for issue in report["issues"]:
+            lines.append(f"    - {issue}")
+    if report["warnings"]:
+        for warning in report["warnings"]:
+            lines.append(f"    ! {warning}")
+
+    lines.append("")
+    lines.append(f"  结论：{report['verdict']}")
+    return "\n".join(lines)

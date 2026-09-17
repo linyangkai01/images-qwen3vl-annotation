@@ -398,7 +398,81 @@ python -m hazard_annotation annotate --config examples/hazard_lab_vlm_project/co
 
 ---
 
-## 九、待你补齐 / 确认
+## 九、连通性探测命令（新增）
+
+### 9.1 为什么需要它
+
+在正式跑真实素材之前，需要先确认「端点通不通、token 对不对、请求体格式合不合」。这一步如果用真实素材试，既浪费又违反隐私约束。
+
+所以做了一个**分层探测命令**，用**本地合成的图**验证全链路，**不涉及任何真实素材**。
+
+### 9.2 三层探测，逐层加深
+
+**第 1 层：TCP 握手** —— 不发送任何数据，只确认端口可达
+
+**第 2 层：无凭据 GET** —— 看服务是否在线、是否强制鉴权。403/401 是**好信号**（说明服务在线且认证层在工作）
+
+**第 3 层：合成图真实请求** —— 默认**不执行**，加 `--send-request` 才发。用的是本地生成的合成 PNG（画面上有几个色块和近似人形/吊钩/吊物的矩形），便于人工判断模型是否真的"看到了"图片
+
+### 9.3 用法
+
+```bash
+# 只看前两层（不发任何业务数据）
+python -m hazard_annotation probe-inference --config examples/hazard_lab_vlm_project/config/project.json
+
+# 三层都跑（需先设置 token；用合成图，不碰真实素材）
+export LAB_VLM_TOKEN="你的 token"
+python -m hazard_annotation probe-inference --config examples/hazard_lab_vlm_project/config/project.json --send-request
+```
+
+### 9.4 实测结果（2026-09-17）
+
+```
+=== 私有 VLM 端点探测 ===
+  途径      : private_vlm
+  端点      : http://119.23.145.227:38091/api/generate
+  模型      : qwen3-vl:30b-a3b-thinking-q8_0
+  images    : array
+  token 环境 : LAB_VLM_TOKEN（未设置）
+
+  [1/3] TCP 握手      : 可连接（47.95ms）
+  [2/3] 无凭据 GET    : HTTP 403（强制鉴权，正常）
+  [3/3] 合成图请求    : 未执行（加 --send-request 可执行）
+
+  待处理：
+    - auth_token_missing:LAB_VLM_TOKEN
+
+  结论：服务在线且强制鉴权；但 token 未设置，带认证的请求还发不了
+```
+
+**三个结论**：
+1. **TCP 可达**（47.95ms）—— 网络路径没问题
+2. **服务在线且强制鉴权** —— 未带 token 被拒，符合预期
+3. **token 尚未配置** —— 这是唯一剩下的阻塞
+
+### 9.5 ⚠️ 一个重要发现：403 来自 nginx，不是应用层
+
+响应体预览是：
+
+```html
+<html><head><title>403 Forbidden</title></head>
+<body><center><h1>403 Forbidden</h1></center>
+<hr><center>nginx/1.</center></body></html>
+```
+
+**这是 nginx 的默认错误页**，说明端点前面挂了 nginx 反向代理。
+
+**影响**：鉴权可能在 **nginx 层**做（而非应用层）。这意味着：
+
+- token 的传递方式（`Authorization: Bearer`）需要与 nginx 的配置匹配
+- 如果 nginx 用的是别的鉴权头（如 `X-Auth-Token`），需要改 `qwen.auth_scheme` 或 `qwen.headers`
+- 配置里已经预留了 `qwen.headers` 和 `qwen.header_env`，可以灵活适配
+
+**建议**：拿到 token 后，先用 `--send-request` 试一次。如果返回 403，说明鉴权头不对，此时需要向部署方确认 nginx 的鉴权配置。
+
+---
+
+## 十、待你补齐 / 确认
 
 **P0-1 填入 Bearer Token**
 ```bash
@@ -420,8 +494,8 @@ export LAB_VLM_TOKEN="你的 token"
 ## 附：本次改动清单
 
 **新增文件**
-- `hazard_annotation/inference.py` —— 途径路由 + 时长校验 + 远程 YOLO 委派
-- `tests/test_hazard_inference.py` —— 46 个用例
+- `hazard_annotation/inference.py` —— 途径路由 + 时长校验 + 远程 YOLO 委派 + 端点探测
+- `tests/test_hazard_inference.py` —— **56 个用例**
 - `examples/hazard_lab_vlm_project/config/project.json` —— 私有 VLM 示例配置
 - `examples/hazard_lab_vlm_project/assets/prompts/combined_zh.md`
 
@@ -430,3 +504,4 @@ export LAB_VLM_TOKEN="你的 token"
 - `traffic_cv_closed_loop/config.py` —— 新增 `inference` 段、`qwen.images_mode` / `options` / `stream`，`api_key_env` 按 provider 智能默认
 - `hazard_annotation/ffmpeg.py` —— 新增 `probe_duration()` + `_parse_seconds()`
 - `hazard_annotation/pipeline/extraction.py` —— 抽帧前接入时长校验，summary 增加 `inference_backend` / `video_duration`
+- `hazard_annotation/__main__.py` —— 新增 `probe-inference` 阶段与 `--send-request` 开关
