@@ -13,7 +13,9 @@ from pathlib import Path
 
 from hazard_annotation.checkpoint import ExtractionCheckpoint
 from hazard_annotation.inference import (
+    VideoDurationRejected,
     check_video_duration,
+    format_segment_intervals,
     render_duration_notice,
     split_duration_segments,
 )
@@ -68,7 +70,13 @@ def run_extraction(config: ProjectConfig, resume: bool = True) -> dict[str, obje
     for source in sources:
         if source.video_path is None:
             continue
-        report = check_video_duration(source.video_path, config)
+        try:
+            report = check_video_duration(source.video_path, config)
+        except VideoDurationRejected as rejected:
+            # 默认策略：拒绝处理该视频并给出人工截取指引。
+            # 打印清晰提示后原样抛出，终止本次抽帧（不静默放行、不自动裁剪）。
+            print(render_duration_notice(rejected.report))
+            raise
         print(render_duration_notice(report))
         warnings.extend(f"{source.source_id}:{code}" for code in report.warnings)
         if report.action == "segment":
@@ -77,8 +85,7 @@ def run_extraction(config: ProjectConfig, resume: bool = True) -> dict[str, obje
             )
             print(
                 f"          建议分段（共 {len(segments)} 段）："
-                + "、".join(f"{s:.0f}-{e:.0f}s" for s, e in segments[:5])
-                + (" …" if len(segments) > 5 else "")
+                + format_segment_intervals(segments)
             )
         duration_report = report
 

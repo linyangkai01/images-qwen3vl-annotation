@@ -29,9 +29,11 @@ from hazard_annotation.inference import (
     RemoteYoloDetector,
     RemoteYoloSettings,
     VideoDurationError,
+    VideoDurationRejected,
     build_inference_router,
     build_synthetic_probe_image,
     check_video_duration,
+    format_segment_intervals,
     parse_endpoint,
     probe_inference_endpoint,
     probe_tcp,
@@ -50,6 +52,7 @@ from traffic_cv_closed_loop.config import (
 from traffic_cv_closed_loop.adapters.qwen import (
     MockQwenAnnotator,
     PrivateVlmAnnotator,
+    _extract_dotenv_value,
     build_qwen_annotator,
 )
 from traffic_cv_closed_loop.config import ProjectConfig
@@ -95,7 +98,7 @@ class InferenceConfigTest(unittest.TestCase):
         self.assertEqual(config.inference_backend, "mock")
         self.assertEqual(config.qwen_images_mode, "array")
         self.assertEqual(config.inference_max_video_seconds, 60.0)
-        self.assertEqual(config.inference_on_over_limit, "warn")
+        self.assertEqual(config.inference_on_over_limit, "reject")
         self.assertEqual(config.inference_segment_seconds, 55.0)
         self.assertIsInstance(config.raw_inference, dict)
 
@@ -141,6 +144,17 @@ class InferenceConfigTest(unittest.TestCase):
         raw = _minimal_raw(inference={"backend": "mock", "on_over_limit": "explode"})
         with self.assertRaises(ValueError):
             ProjectConfig.load(_write_config(raw))
+
+    def test_reject_over_limit_policy_accepted(self) -> None:
+        raw = _minimal_raw(inference={"backend": "mock", "on_over_limit": "reject"})
+        config = ProjectConfig.load(_write_config(raw))
+        self.assertEqual(config.inference_on_over_limit, "reject")
+
+    def test_default_over_limit_policy_is_reject(self) -> None:
+        # 未写 inference 段时应回退到「拒绝 + 人工截取指引」的新默认值
+        raw = _minimal_raw(inference={"backend": "mock"})
+        config = ProjectConfig.load(_write_config(raw))
+        self.assertEqual(config.inference_on_over_limit, "reject")
 
     def test_segment_longer_than_limit_rejected(self) -> None:
         raw = _minimal_raw(
@@ -417,7 +431,116 @@ class TokenResolutionTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# 4. Remote (lab-server) YOLO delegation
+# 4. Token from a .env file (KEY=VALUE)
+# --------------------------------------------------------------------------- #
+class DotenvTokenTest(unittest.TestCase):
+    """``qwen.api_key_name`` 让 token 可以直接复用既有的 .env。
+
+    用户的凭据本来就躺在服务器上的 ``.env`` 里，没必要为了本项目再复制一份 ——
+    复制只会让凭据散落多处，增加泄露面。
+    """
+
+    def test_basic_key_value(self) -> None:
+        self.assertEqual(_extract_dotenv_value("LAB_VLM_TOKEN=abc", "LAB_VLM_TOKEN"), "abc")
+
+    def test_comments_and_blank_lines_are_skipped(self) -> None:
+        text = "# 实验室私有 VLM\n\n   \nLAB_VLM_TOKEN=tok\n# trailing\n"
+        self.assertEqual(_extract_dotenv_value(text, "LAB_VLM_TOKEN"), "tok")
+
+    def test_quoted_values_are_unwrapped(self) -> None:
+        self.assertEqual(_extract_dotenv_value('K="dq"', "K"), "dq")
+        self.assertEqual(_extract_dotenv_value("K='sq'", "K"), "sq")
+
+    def test_export_prefix_is_tolerated(self) -> None:
+        self.assertEqual(_extract_dotenv_value("export K=val", "K"), "val")
+
+    def test_missing_key_returns_none(self) -> None:
+        self.assertIsNone(_extract_dotenv_value("OTHER=1", "LAB_VLM_TOKEN"))
+
+    def test_empty_value_returns_empty_string(self) -> None:
+        self.assertEqual(_extract_dotenv_value("K=", "K"), "")
+
+    def test_inline_hash_is_not_stripped(self) -> None:
+        """token 里出现 # 是合法的，按注释切掉会截断凭据。"""
+        self.assertEqual(_extract_dotenv_value("K=a#b#c", "K"), "a#b#c")
+
+    def test_line_without_equals_is_ignored(self) -> None:
+        self.assertIsNone(_extract_dotenv_value("just-a-line\n", "just-a-line"))
+
+    def test_key_match_is_exact(self) -> None:
+        text = "LAB_VLM_TOKEN_OLD=old\nLAB_VLM_TOKEN=new\n"
+        self.assertEqual(_extract_dotenv_value(text, "LAB_VLM_TOKEN"), "new")
+
+    def test_last_occurrence_wins(self) -> None:
+        text = "K=first\nK=second\n"
+        self.assertEqual(_extract_dotenv_value(text, "K"), "second")
+
+
+class DotenvIntegrationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.project = Path(self.tmp.name) / "proj"
+        (self.project / "config").mkdir(parents=True, exist_ok=True)
+        (self.project / "input" / "frames").mkdir(parents=True, exist_ok=True)
+        (self.project / "secret").mkdir(parents=True, exist_ok=True)
+        os.environ.pop("LAB_VLM_TOKEN", None)
+
+    def tearDown(self) -> None:
+        os.environ.pop("LAB_VLM_TOKEN", None)
+        self.tmp.cleanup()
+
+    def _write_config(self, key_file: str, key_name: str) -> ProjectConfig:
+        raw = json.loads(LAB_VLM_CONFIG.read_text(encoding="utf-8"))
+        raw["qwen"]["api_key_file"] = key_file
+        raw["qwen"]["api_key_name"] = key_name
+        (self.project / "config" / "project.json").write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+        )
+        return ProjectConfig.load(self.project / "config" / "project.json")
+
+    def test_token_read_from_dotenv(self) -> None:
+        (self.project / "secret" / ".env").write_text(
+            "# 实验室私有 VLM\nOTHER=x\nLAB_VLM_TOKEN=from-dotenv\n", encoding="utf-8"
+        )
+        config = self._write_config("secret/.env", "LAB_VLM_TOKEN")
+        headers = build_qwen_annotator(config)._build_headers()
+        self.assertEqual(headers["Authorization"], "Bearer from-dotenv")
+
+    def test_custom_key_name_is_honoured(self) -> None:
+        (self.project / "secret" / ".env").write_text("MY_VLM_KEY=custom\n", encoding="utf-8")
+        config = self._write_config("secret/.env", "MY_VLM_KEY")
+        headers = build_qwen_annotator(config)._build_headers()
+        self.assertEqual(headers["Authorization"], "Bearer custom")
+
+    def test_wrong_key_name_raises_with_hint(self) -> None:
+        (self.project / "secret" / ".env").write_text("LAB_VLM_TOKEN=x\n", encoding="utf-8")
+        config = self._write_config("secret/.env", "NOPE")
+        with self.assertRaises(ValueError) as ctx:
+            build_qwen_annotator(config)._build_headers()
+        message = str(ctx.exception)
+        self.assertIn("没找到键 NOPE", message)
+        self.assertIn("api_key_name", message)
+
+    def test_env_var_still_beats_dotenv(self) -> None:
+        (self.project / "secret" / ".env").write_text("LAB_VLM_TOKEN=from-dotenv\n", encoding="utf-8")
+        config = self._write_config("secret/.env", "LAB_VLM_TOKEN")
+        os.environ["LAB_VLM_TOKEN"] = "from-env"
+        try:
+            headers = build_qwen_annotator(config)._build_headers()
+        finally:
+            os.environ.pop("LAB_VLM_TOKEN", None)
+        self.assertEqual(headers["Authorization"], "Bearer from-env")
+
+    def test_without_key_name_raw_first_line_is_used(self) -> None:
+        """不设 api_key_name 时退回裸 token 语义，行为不变。"""
+        (self.project / "token.txt").write_text("# comment\nraw-token\n", encoding="utf-8")
+        config = self._write_config("token.txt", "")
+        headers = build_qwen_annotator(config)._build_headers()
+        self.assertEqual(headers["Authorization"], "Bearer raw-token")
+
+
+# --------------------------------------------------------------------------- #
+# 5. Remote (lab-server) YOLO delegation
 # --------------------------------------------------------------------------- #
 class RemoteYoloTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -557,6 +680,67 @@ class VideoDurationGuardTest(unittest.TestCase):
         self.assertEqual(report.segment_count, 66)
         self.assertIn("66 段", render_duration_notice(report))
 
+    # -- 默认策略 reject：拒绝处理 + 人工截取指引（用户 2026-09-17 决策） ----- #
+    def test_default_policy_rejects_over_limit_video(self) -> None:
+        # setUp 用 MOCK_CONFIG（无 inference 段）→ 走默认策略 reject
+        with self.assertRaises(VideoDurationRejected) as ctx:
+            check_video_duration("x.mp4", self.config, runner=_StubProbe(90.0))
+        message = str(ctx.exception)
+        self.assertIn("90.0", message)  # 实际时长
+        self.assertIn("60", message)  # 上限
+        self.assertIn("已拒绝处理", message)
+        self.assertIn("0-55s", message)  # 建议截取区间
+        self.assertIn("55-90s", message)
+        self.assertIn("请人工截取 ≤ 1 分钟的片段后重新投喂", message)
+
+    def test_reject_is_a_video_duration_error_subclass(self) -> None:
+        # 保留向后兼容：捕获 VideoDurationError 的调用方仍能拦住 reject
+        with self.assertRaises(VideoDurationError):
+            check_video_duration("x.mp4", self.config, runner=_StubProbe(90.0))
+
+    def test_reject_carries_report_for_persistence(self) -> None:
+        with self.assertRaises(VideoDurationRejected) as ctx:
+            check_video_duration("x.mp4", self.config, runner=_StubProbe(90.0))
+        report = ctx.exception.report
+        self.assertEqual(report.status, "over_limit")
+        self.assertEqual(report.action, "reject")
+        self.assertEqual(report.segment_count, 2)
+        self.assertIn("video_over_limit_rejected", report.warnings)
+        payload = report.to_dict()
+        # 落盘字段必须与新策略名一致
+        self.assertEqual(payload["action"], "reject")
+        self.assertEqual(payload["status"], "over_limit")
+        self.assertEqual(payload["duration_seconds"], 90.0)
+        self.assertEqual(payload["limit_seconds"], 60.0)
+        self.assertIn("video_over_limit_rejected", payload["warnings"])
+
+    def test_reject_policy_configurable_explicitly(self) -> None:
+        self.config.inference_on_over_limit = "reject"
+        with self.assertRaises(VideoDurationRejected):
+            check_video_duration("x.mp4", self.config, runner=_StubProbe(3600.0))
+
+    def test_reject_does_not_silently_pass(self) -> None:
+        """默认策略不得静默放行：超限即拒绝，不返回 proceed/warn 报告。"""
+        with self.assertRaises(VideoDurationRejected):
+            check_video_duration("x.mp4", self.config, runner=_StubProbe(61.0))
+
+    def test_reject_does_not_auto_segment(self) -> None:
+        """默认策略只给建议区间，绝不自动裁剪/自动分段执行。"""
+        with self.assertRaises(VideoDurationRejected) as ctx:
+            check_video_duration("x.mp4", self.config, runner=_StubProbe(120.0))
+        # 报告只描述「建议」区间，不存在任何已执行的裁剪产物
+        self.assertFalse(hasattr(ctx.exception.report, "segments"))
+        self.assertEqual(ctx.exception.report.action, "reject")
+
+    def test_format_segment_intervals_renders_ranges(self) -> None:
+        self.assertEqual(
+            format_segment_intervals([(0.0, 55.0), (55.0, 90.0)]), "0-55s、55-90s"
+        )
+        self.assertEqual(format_segment_intervals([]), "")
+        self.assertTrue(
+            format_segment_intervals([(i, i + 1) for i in range(7)]).endswith("…")
+        )
+
     def test_unknown_duration_is_not_treated_as_over_limit(self) -> None:
         report = check_video_duration("x.mp4", self.config, runner=_StubProbe(0.0))
         self.assertEqual(report.status, "unknown")
@@ -647,7 +831,7 @@ class InferenceRouterTest(unittest.TestCase):
     def test_describe_exposes_duration_policy(self) -> None:
         info = InferenceRouter(self.config).describe()
         self.assertEqual(info["max_video_seconds"], 60.0)
-        self.assertEqual(info["on_over_limit"], "warn")
+        self.assertEqual(info["on_over_limit"], "reject")
 
     def test_write_report_persists_describe_output(self) -> None:
         router = build_inference_router(self.config)

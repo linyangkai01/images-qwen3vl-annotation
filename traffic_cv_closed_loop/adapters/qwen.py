@@ -15,6 +15,41 @@ from traffic_cv_closed_loop.io_utils import image_mime_type, read_json, stem_sid
 from traffic_cv_closed_loop.models import CandidateFrame, Detection
 
 
+def _extract_dotenv_value(text: str, key_name: str) -> str | None:
+    """从 ``KEY=VALUE`` 风格文本里取出 ``key_name`` 的值。
+
+    刻意保持克制，只做最小解析：
+
+    * 跳过空行与 ``#`` 开头的整行注释；
+    * 支持可选的 ``export `` 前缀；
+    * 去掉值两侧成对的单/双引号；
+    * **不剥离行内 ``#``** —— token 里出现 ``#`` 是合法的，
+      按注释切掉会截断凭据。这是有意的取舍。
+
+    找不到键返回 ``None``；找到但值为空返回空串。
+    **重复出现时后者覆盖前者** —— 与 python-dotenv / Docker Compose /
+    shell ``source`` 的语义一致。
+    """
+    target = key_name.strip()
+    found: str | None = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        key, separator, value = line.partition("=")
+        if not separator:
+            continue
+        if key.strip() != target:
+            continue
+        cleaned = value.strip()
+        if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in ("'", '"'):
+            cleaned = cleaned[1:-1]
+        found = cleaned
+    return found
+
+
 class ThinkingJsonParser:
     """Robust JSON extraction for thinking models.
 
@@ -446,33 +481,62 @@ class OpenAICompatibleQwenAnnotator:
         文件方式更稳：环境变量在不同进程/终端之间不共享，而探测、标注、
         训练往往是各自独立的进程。
 
-        文件读取只取**第一个非空行**并去掉首尾空白，这样用
-        ``echo <token> > token.txt`` 或手写带换行的文件都能用。
+        文件支持两种格式，由 ``qwen.api_key_name`` 决定：
+
+        * **未设置** ``api_key_name`` —— 文件首行非空内容即 token。
+          适合 ``echo <token> > token.txt`` 这种裸 token 文件。
+        * **设置了** ``api_key_name`` —— 按 ``KEY=VALUE`` 解析（.env 风格），
+          取该键的值。支持 ``#`` 注释、空行、值两侧的引号。
+          这样可以直接复用既有的 .env，不必把 token 复制一份出来。
+
+        任何情况下都只返回 token 本身，不记录、不回显文件其余内容。
         """
         api_key = os.environ.get(self.config.qwen_api_key_env, "").strip()
         if api_key:
             return api_key
 
         key_file = getattr(self.config, "qwen_api_key_file", "") or ""
-        if key_file:
-            path = Path(key_file)
-            if not path.exists():
-                raise ValueError(
-                    f"缺少 API token：环境变量 {self.config.qwen_api_key_env} 未设置，"
-                    f"token 文件也不存在：{path}（配置项 qwen.api_key_file）。\n"
-                    f"二选一即可：\n"
-                    f"  1) 设置环境变量 {self.config.qwen_api_key_env}=<Bearer Token>\n"
-                    f"  2) 把 token 写进文件 {path}（首行非空内容即可）"
-                )
-            for raw_line in path.read_text(encoding="utf-8").splitlines():
-                candidate = raw_line.strip()
-                if candidate:
-                    return candidate
+        if not key_file:
+            return ""
+
+        path = Path(key_file)
+        if not path.exists():
             raise ValueError(
-                f"缺少 API token：token 文件是空的：{path}（配置项 qwen.api_key_file）。\n"
-                f"请把 token 写入该文件的首行，或改用环境变量 {self.config.qwen_api_key_env}"
+                f"缺少 API token：环境变量 {self.config.qwen_api_key_env} 未设置，"
+                f"token 文件也不存在：{path}（配置项 qwen.api_key_file）。\n"
+                f"二选一即可：\n"
+                f"  1) 设置环境变量 {self.config.qwen_api_key_env}=<Bearer Token>\n"
+                f"  2) 把 token 写进文件 {path}"
             )
-        return ""
+
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as error:
+            raise ValueError(f"读取 token 文件失败：{path}（{error}）") from error
+
+        key_name = (getattr(self.config, "qwen_api_key_name", "") or "").strip()
+        if key_name:
+            value = _extract_dotenv_value(text, key_name)
+            if value is None:
+                raise ValueError(
+                    f"在 {path} 里没找到键 {key_name}（配置项 qwen.api_key_name）。\n"
+                    f"请确认该 .env 里存在 {key_name}=<Bearer Token>，"
+                    f"或把 qwen.api_key_name 改成正确的键名。"
+                )
+            if not value:
+                raise ValueError(
+                    f"在 {path} 里找到了键 {key_name}，但它的值是空的。"
+                )
+            return value
+
+        for raw_line in text.splitlines():
+            candidate = raw_line.strip()
+            if candidate and not candidate.startswith("#"):
+                return candidate
+        raise ValueError(
+            f"缺少 API token：token 文件是空的：{path}（配置项 qwen.api_key_file）。\n"
+            f"请把 token 写入该文件的首行，或改用环境变量 {self.config.qwen_api_key_env}"
+        )
 
     def _build_headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}

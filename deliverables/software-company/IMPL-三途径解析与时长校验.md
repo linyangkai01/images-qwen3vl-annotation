@@ -63,7 +63,7 @@ inference.backend=local_yolo 不提供多模态标注能力；
   "auth_env": "LAB_VLM_TOKEN",
   "auth_token_present": false,
   "max_video_seconds": 60.0,
-  "on_over_limit": "warn",
+  "on_over_limit": "reject",
   "issues": ["auth_token_missing:LAB_VLM_TOKEN"],
   "notes": ["请设置环境变量 LAB_VLM_TOKEN=<Bearer Token>"]
 }
@@ -163,35 +163,106 @@ OpenAI 兼容格式需要 `data:image/png;base64,xxx`，但你给的接口示例
 
 ## 四、Bearer Token 配置（已预留）
 
-### 4.1 配置项
+### 4.1 三种来源，按优先级尝试
 
 ```json
 "qwen": {
   "api_key_env": "LAB_VLM_TOKEN",
+  "api_key_file": "token.txt",
+  "api_key_name": "",
   "auth_scheme": "Bearer",
   "require_api_key": true
 }
 ```
 
-- `api_key_env`：**存 token 的环境变量名**。走 `private_vlm` 途径时默认就是 `LAB_VLM_TOKEN`
+**取 token 顺序**：① 环境变量 `api_key_env` → ② `api_key_file` 指向的文件
+
+- `api_key_env`：存 token 的环境变量名。走 `private_vlm` 途径时默认 `LAB_VLM_TOKEN`
+- `api_key_file`：**token 文件路径**，相对项目目录解析
+- `api_key_name`：**token 文件的格式开关**（见 4.3）
 - `auth_scheme`：默认 `Bearer`，拼成 `Authorization: Bearer <token>`
-- `require_api_key`：`true` 时缺 token 直接报错；`false` 时放行
+- `require_api_key`：`true` 时两处都取不到就报错
 
-### 4.2 填入方式
+### 4.2 为什么要有 token 文件这一路
 
-```bash
-# Linux / macOS
-export LAB_VLM_TOKEN="你的 token"
+**环境变量不跨进程/终端共享。** 你在自己的终端里 `export`，而探测、标注、训练各自是独立进程，看不到那个变量。token 文件没有这个问题。
 
-# Windows Git Bash
-export LAB_VLM_TOKEN="你的 token"
+### 4.3 token 文件支持两种格式（由 `api_key_name` 决定）
+
+**格式一：裸 token（`api_key_name` 留空）**
+
+文件首行非空内容即 token。适合：
+
+```
+echo <token> > token.txt
 ```
 
-### 4.3 安全约定
+**格式二：`.env` 风格（`api_key_name` 填键名）**
 
-- **token 不写进配置文件**，只通过环境变量注入
-- **token 不写进日志**：`request_preview` 里只记录环境变量**名字**（`auth_env`），不记录值
-- 缺失时 `describe()` 会给出明确指引，不会静默失败
+按 `KEY=VALUE` 解析，取指定键的值。这样**可以直接复用既有的 `.env`，不必把 token 复制一份出来**——复制只会让凭据散落多处，增加泄露面。
+
+```json
+"api_key_file": "secret/.env",
+"api_key_name": "LAB_VLM_TOKEN"
+```
+
+解析规则（刻意保持克制）：
+
+- 跳过空行与 `#` 开头的整行注释
+- 支持可选的 `export ` 前缀
+- 去掉值两侧成对的单/双引号
+- **不剥离行内 `#`** —— token 里出现 `#` 是合法的，按注释切掉会截断凭据
+- **重复出现时后者覆盖前者** —— 与 python-dotenv / Docker Compose / shell `source` 语义一致
+
+### 4.4 配置方式（三选一）
+
+**方式一：直接复用既有的 `.env`（推荐，不产生副本）**
+
+把 `api_key_file` 指向 `.env` 的路径，`api_key_name` 填键名。**token 不需要复制到别处。**
+
+**方式二：单独建一个 token 文件**
+
+在 `examples/hazard_lab_vlm_project/` 下新建 `token.txt`，把 token 写进去（首行即可），`api_key_name` 留空。配置里 `api_key_file` 已经指向它，**不用改配置**。
+
+该文件已被 `.gitignore` 覆盖（`token.txt` / `*.token` / `.env` / `.secrets/`），**不会入库**。
+
+**方式三：环境变量**
+
+```bash
+# Git Bash（当前会话）
+export LAB_VLM_TOKEN="你的 token"
+
+# 或 PowerShell（当前会话）
+$env:LAB_VLM_TOKEN = "你的 token"
+
+# 或 PowerShell（持久，需重开终端）
+[Environment]::SetEnvironmentVariable("LAB_VLM_TOKEN", "你的 token", "User")
+```
+
+### 4.5 验证
+
+```bash
+python -m hazard_annotation probe-inference \
+  --config examples/hazard_lab_vlm_project/config/project.json \
+  --send-request
+```
+
+`--send-request` 会发一次真实请求，但用的是**本地合成图**，不涉及任何真实素材。
+
+### 4.6 安全约定
+
+- **token 不写进配置文件**，只通过环境变量或独立文件注入
+- **token 不写进日志**：`request_preview` 里只记录环境变量**名字**与文件**路径**，不记录值
+- `.gitignore` 覆盖 `*.token` / `token.txt` / `.env` / `.env.*` / `.secrets/` / `secrets/`
+- 缺失时 `describe()` 给出明确指引，不会静默失败
+- 报错信息**同时给出多种配置方式**，避免只看到一条路
+- 文件读取只返回 token 本身，**不回显文件其余内容**
+
+### 4.7 取 token 的细节
+
+- 键名写错时报错会指出「在 <路径> 里没找到键 <名字>」，并提示检查 `qwen.api_key_name`
+- 键存在但值为空时单独报错，与「键不存在」区分开
+- 文件不存在 / 为空时，报错会指出具体路径与替代方案
 
 ---
 
@@ -258,17 +329,26 @@ workspace/
 2. 回退解析 `ffmpeg -i` stderr 里的 `Duration: 00:01:23.45`
 3. 都失败返回 `0.0`，视为**未知**，**不阻断流程**（避免把探测失败误判成超限）
 
-### 6.2 三种处置策略（`inference.on_over_limit`）
+### 6.2 四种处置策略（`inference.on_over_limit`）
 
-**`warn`（默认）** —— 打印告警但放行
+**`reject`（默认，用户 2026-09-17 决策）** —— 拒绝处理该视频 + 人工截取指引。
+检测到超限即**停止处理该视频**（抛出 `VideoDurationRejected`），提示中给出实际
+时长、上限、建议截取区间，并明确要求人工截取；**不自动裁剪、不静默放行、不自动
+执行分段**。
+```
+[时长校验] 拒绝：视频时长 90.0s 超过私有多模态模型上限 60s，已拒绝处理；
+建议切成 2 段（每段 ≤ 55s）：0-55s、55-90s。请人工截取 ≤ 1 分钟的片段后重新投喂。
+```
+
+**`warn`（可配置）** —— 打印告警但放行
 ```
 [时长校验] 告警：视频时长 3600.0s 超过私有多模态模型上限 60s；
 已按 on_over_limit=warn 放行，但结果可能不完整，建议改用 segment 模式
 ```
 
-**`error`** —— 直接拒绝并抛 `VideoDurationError`，附上修改指引
+**`error`（可配置）** —— 直接拒绝并抛 `VideoDurationError`，附上修改指引
 
-**`segment`** —— 计算需要切成几段并给出具体区间
+**`segment`（可配置，非默认）** —— 计算需要切成几段并给出具体区间（仅建议，不自动执行）
 ```
 [时长校验] 超限：时长 90.0s 超过上限 60s，建议切成 2 段（每段 ≤ 55s）后再送模型
           建议分段（共 2 段）：0-55s、55-90s
@@ -279,7 +359,7 @@ workspace/
 ```json
 "inference": {
   "max_video_seconds": 60,
-  "on_over_limit": "segment",
+  "on_over_limit": "reject",
   "segment_seconds": 55
 }
 ```
@@ -296,13 +376,15 @@ workspace/
   "duration_seconds": 90.0,
   "limit_seconds": 60.0,
   "status": "over_limit",
-  "action": "segment",
+  "action": "reject",
   "segment_count": 2,
-  "message": "时长 90.0s 超过上限 60s，建议切成 2 段（每段 ≤ 55s）后再送模型",
-  "warnings": ["video_over_limit_segmented"]
+  "message": "视频时长 90.0s 超过私有多模态模型上限 60s，已拒绝处理；建议切成 2 段（每段 ≤ 55s）：0-55s、55-90s。请人工截取 ≤ 1 分钟的片段后重新投喂。",
+  "warnings": ["video_over_limit_rejected"]
 }
 ```
 
+`action` 与 `on_over_limit` 同名同义（`reject` / `warn` / `error` / `segment`）；
+`reject` 策略下报告随 `VideoDurationRejected` 异常一并携带，供调用方落盘或展示。
 同时把告警码写进 summary 的 `warnings` 数组，便于下游聚合。
 
 ---
@@ -325,7 +407,7 @@ examples/hazard_lab_vlm_project/
 "inference": {
   "backend": "private_vlm",
   "max_video_seconds": 60,
-  "on_over_limit": "warn",
+  "on_over_limit": "reject",
   "segment_seconds": 55
 },
 "qwen": {
@@ -386,8 +468,10 @@ python -m hazard_annotation annotate --config examples/hazard_lab_vlm_project/co
 **时长校验**
 - 45s → ok 放行
 - 60s（恰好）→ ok 放行
-- 90s + segment → 切成 2 段
+- 90s + 默认（reject）→ 拒绝处理 + 人工截取指引（0-55s、55-90s）
+- 90s + segment → 切成 2 段（仅建议，不自动执行）
 - 3600s + warn → 告警放行
+- 探测失败 → 未知，放行不误伤
 - 3600s + error → 抛错
 - 探测失败 → 视为未知，**不误伤**
 

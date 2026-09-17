@@ -8,7 +8,9 @@
 * ``mock``         —— 离线 sidecar，不联网
 
 同时负责**视频时长校验**：私有多模态模型受算力限制，只能处理 1 分钟以内的
-视频。超限时按 ``inference.on_over_limit`` 处置（``warn`` / ``error`` / ``segment``）。
+视频。超限时按 ``inference.on_over_limit`` 处置，默认 ``reject``——**拒绝处理
+并给出人工截取指引**（不自动裁剪、不静默放行、不自动执行分段）；``warn`` /
+``error`` / ``segment`` 保留为可配置项。
 
 设计原则：
 * 不引入第三方依赖，只用标准库；
@@ -57,6 +59,22 @@ class VideoDurationError(RuntimeError):
     """视频超出私有多模态模型的时长上限，且处置策略为 ``error``。"""
 
 
+class VideoDurationRejected(VideoDurationError):
+    """视频超出私有多模态模型的时长上限，且处置策略为默认的 ``reject``。
+
+    ``reject`` 的语义是「**拒绝处理该视频 + 给出人工截取指引**」——不自动裁剪、
+    不静默放行、不自动执行分段，提示用户自行截取 ≤ 1 分钟的片段后重新投喂。
+
+    与 ``error``（纯报错）的区别在于：本异常**携带完整的
+    :class:`VideoDurationReport`**，调用方在拒绝流程中仍可取用该报告（含
+    时长、上限、分段数、提示语与告警码）做落盘或展示。
+    """
+
+    def __init__(self, report: "VideoDurationReport") -> None:
+        super().__init__(report.message)
+        self.report = report
+
+
 class InferenceConfigError(RuntimeError):
     """所选推理途径缺少必要配置。"""
 
@@ -72,7 +90,7 @@ class VideoDurationReport:
     duration_seconds: float
     limit_seconds: float
     status: str  # ok | over_limit | unknown
-    action: str  # proceed | warn | error | segment
+    action: str  # proceed | warn | error | segment | reject
     segment_count: int = 0
     message: str = ""
     warnings: list[str] = field(default_factory=list)
@@ -104,8 +122,9 @@ def check_video_duration(
     * ``duration == 0`` 视为**未知**（ffprobe/ffmpeg 都没给出时长）：记 warning 但放行，
       因为把「探测失败」当成「超限」会误伤。
     * 超限时按 ``config.inference_on_over_limit`` 给出 ``action``：
-      ``warn`` 放行并告警、``error`` 抛 :class:`VideoDurationError`、
-      ``segment`` 计算需要切成几段（每段 ``segment_seconds``）。
+      ``reject``（默认）抛 :class:`VideoDurationRejected`——**拒绝处理**并给出
+      人工截取指引；``warn`` 放行并告警；``error`` 抛 :class:`VideoDurationError`；
+      ``segment`` 计算需要切成几段（每段 ``segment_seconds``），仅给建议不自动执行。
     """
     path = Path(video_path)
     limit = float(config.inference_max_video_seconds)
@@ -148,11 +167,34 @@ def check_video_duration(
         )
 
     # --- 超限 ---
+    if policy == "reject":
+        # 默认策略：拒绝处理该视频，并给出人工截取指引。
+        # 不自动裁剪、不静默放行、不自动执行分段——用户需自行截取片段后重新投喂。
+        segment_count = int(-(-duration // segment_seconds))  # 向上取整
+        intervals = format_segment_intervals(
+            split_duration_segments(duration, segment_seconds)
+        )
+        report = VideoDurationReport(
+            video_path=str(path),
+            duration_seconds=duration,
+            limit_seconds=limit,
+            status="over_limit",
+            action="reject",
+            segment_count=segment_count,
+            message=(
+                f"视频时长 {duration:.1f}s 超过私有多模态模型上限 {limit:.0f}s，已拒绝处理；"
+                f"建议切成 {segment_count} 段（每段 ≤ {segment_seconds:.0f}s）：{intervals}。"
+                f"请人工截取 ≤ 1 分钟的片段后重新投喂。"
+            ),
+            warnings=["video_over_limit_rejected"],
+        )
+        raise VideoDurationRejected(report)
+
     if policy == "error":
         raise VideoDurationError(
             f"视频时长 {duration:.1f}s 超过上限 {limit:.0f}s；"
             f"当前 inference.on_over_limit=error。"
-            f"可改为 warn（告警放行）或 segment（自动分段）。"
+            f"可改为 reject（拒绝 + 人工截取指引）、warn（告警放行）或 segment（给出分段建议）。"
         )
 
     if policy == "segment":
@@ -183,6 +225,12 @@ def check_video_duration(
         ),
         warnings=["video_over_limit_warned"],
     )
+
+
+def format_segment_intervals(segments: list[tuple[float, float]]) -> str:
+    """把 ``(start, end)`` 段列表渲染成 ``0-55s、55-90s`` 形式（最多 5 段，超出省略）。"""
+    shown = "、".join(f"{start:.0f}-{end:.0f}s" for start, end in segments[:5])
+    return shown + (" …" if len(segments) > 5 else "")
 
 
 def split_duration_segments(
@@ -544,6 +592,8 @@ def render_duration_notice(report: VideoDurationReport) -> str:
         return f"[时长校验] 超限：{report.message}"
     if report.action == "warn":
         return f"[时长校验] 告警：{report.message}"
+    if report.action == "reject":
+        return f"[时长校验] 拒绝：{report.message}"
     return f"[时长校验] 拒绝：{report.message}"
 
 

@@ -391,6 +391,9 @@ class ProjectConfig:
     #: 存放 token 的文件路径（环境变量取不到时的回退）。
     #: 比环境变量更稳：环境变量不跨进程/终端共享，而探测、标注、训练各自独立进程。
     qwen_api_key_file: str
+    #: 当 token 文件是 ``.env``（KEY=VALUE）格式时，指定取哪个键。
+    #: 留空则把文件首行非空内容当作裸 token。
+    qwen_api_key_name: str
     qwen_require_api_key: bool
     qwen_timeout_seconds: int
     qwen_max_retries: int
@@ -446,8 +449,9 @@ class ProjectConfig:
     inference_backend: str = "mock"
     #: 私有多模态模型的视频时长上限（秒）。超过则按 on_over_limit 处置。
     inference_max_video_seconds: float = 60.0
-    #: 超限处置：warn（告警放行）| error（直接报错）| segment（自动分段）
-    inference_on_over_limit: str = "warn"
+    #: 超限处置：reject（默认，拒绝处理 + 人工截取指引）| warn（告警放行）|
+    #: error（直接报错）| segment（给出分段区间建议，不自动执行）。
+    inference_on_over_limit: str = "reject"
     #: segment 模式下的分段长度（秒），默认留 5 秒余量。
     inference_segment_seconds: float = 55.0
     #: ``inference`` 段的原始字典（供 server_yolo 等读取 server.* 子项）。
@@ -566,6 +570,7 @@ class ProjectConfig:
             )
             if qwen_cfg.get("api_key_file")
             else "",
+            qwen_api_key_name=str(qwen_cfg.get("api_key_name", "") or ""),
             qwen_api_key_env=str(
                 qwen_cfg.get(
                     "api_key_env",
@@ -628,7 +633,7 @@ class ProjectConfig:
             qwen_stream=bool(qwen_cfg.get("stream", False)),
             inference_backend=str(inference_cfg.get("backend", "mock")),
             inference_max_video_seconds=float(inference_cfg.get("max_video_seconds", 60.0)),
-            inference_on_over_limit=str(inference_cfg.get("on_over_limit", "warn")),
+            inference_on_over_limit=str(inference_cfg.get("on_over_limit", "reject")),
             inference_segment_seconds=float(inference_cfg.get("segment_seconds", 55.0)),
             raw_inference=_json_dict(inference_cfg),
             inference_endpoint_mode=str(endpoint_policy_cfg.get("mode", "local_only")),
@@ -660,8 +665,10 @@ class ProjectConfig:
             )
         if self.inference_max_video_seconds <= 0:
             raise ValueError("inference.max_video_seconds must be > 0")
-        if self.inference_on_over_limit not in ("warn", "error", "segment"):
-            raise ValueError("inference.on_over_limit must be one of warn / error / segment")
+        if self.inference_on_over_limit not in ("reject", "warn", "error", "segment"):
+            raise ValueError(
+                "inference.on_over_limit must be one of reject / warn / error / segment"
+            )
         if self.inference_segment_seconds <= 0:
             raise ValueError("inference.segment_seconds must be > 0")
         if self.inference_segment_seconds > self.inference_max_video_seconds:
