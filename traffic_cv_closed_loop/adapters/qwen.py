@@ -14,6 +14,59 @@ from traffic_cv_closed_loop.config import ProjectConfig
 from traffic_cv_closed_loop.io_utils import image_mime_type, read_json, stem_sidecar
 from traffic_cv_closed_loop.models import CandidateFrame, Detection
 
+#: 私有 VLM 端点**HTTP 请求体（JSON）字节上限**的默认值：``0`` = **不设上限**。
+#:
+#: 早先这里默认 1MiB（对齐 nginx ``client_max_body_size`` 默认值），但该假设经
+#: 实测证伪：本实验室端点 1/2/4/8 张帧分别约 0.47/0.95/1.90/3.80MB 请求体**全部
+#: 返回 HTTP 200**，端点**没有** 1MB 体积限制。按体积拦截只会拦死合法的多图请求
+#: （4 张帧约 1.9MB 即被误拦），因此默认关闭。
+#:
+#: 「误把视频文件当图片发出」这一类问题**不由体积负责** —— 一个误传的视频与 8 张
+#: 合法帧体积相同，靠体积区分不了；改由 :func:`_image_format_of` 的**图片魔数校验**
+#: 识别（见 :meth:`PrivateVlmAnnotator._ensure_images_are_images`）。
+#:
+#: 口径仍是「序列化后的请求体字节数」（图片 base64 后膨胀约 4/3 再进 JSON）。
+#: 部署方确需客户端侧绝对上限时才配置 ``qwen.max_request_bytes``；``<= 0`` 关闭。
+DEFAULT_MAX_REQUEST_BYTES: int = 0
+
+#: 图片文件的魔数签名（纯字节比对，不解码、零第三方依赖）。
+#:
+#: 用于在**发送前**判断「要发的东西到底是不是图片」：视频源若误把视频文件
+#: （``original_path``）当图片发出，服务端按图片解码会失败并重置连接，客户端只看到
+#: 一个裸的 ``Connection reset by peer``。体积无法区分（见上），魔数可以。
+#:
+#: 覆盖本链路实际会产出的格式：PNG（ffmpeg 抽帧）、Netpbm（mock / 图片目录来源）、
+#: 以及常见的 JPEG/GIF/BMP/TIFF/WebP/JP2。ISO-BMFF 系（HEIC/AVIF/MP4）刻意不收：
+#: 它们共享 ``ftyp`` 盒子、无法只凭魔数区分图片与 MP4，而本链路的已知失败模式正是 MP4。
+_NETPBM_DIGITS: bytes = b"123456"
+
+
+def _image_format_of(data: bytes) -> str | None:
+    """返回 ``data`` 头部对应的图片格式名；不是已知图片则返回 ``None``。
+
+    只看头部字节，不做任何解码，因此对截断/损坏的图片文件仍可能返回格式名 ——
+    这正是想要的：本函数只回答「这**看起来**是不是图片」，把「明显不是图片」
+    （如 MP4）挡在发送之前。
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "PNG"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "JPEG"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "GIF"
+    if data.startswith(b"BM"):
+        return "BMP"
+    if data.startswith((b"II*\x00", b"MM\x00*")):
+        return "TIFF"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "WebP"
+    if data.startswith(b"\x00\x00\x00\x0cjP  \r\n\x87\n"):
+        return "JPEG 2000"
+    # Netpbm: ``P1``..``P6``（P2/P3 ASCII、P5/P6 二进制、P1/P4 位图）
+    if len(data) >= 2 and data[:1] == b"P" and data[1:2] in _NETPBM_DIGITS:
+        return "Netpbm"
+    return None
+
 
 def _extract_dotenv_value(text: str, key_name: str) -> str | None:
     """从 ``KEY=VALUE`` 风格文本里取出 ``key_name`` 的值。
@@ -474,6 +527,90 @@ class OpenAICompatibleQwenAnnotator:
     def provider_label(self) -> str:
         return "local_openai" if self.config.qwen_provider.lower() == "local_openai" else "openai_compatible"
 
+    def _image_path_for(self, candidate: CandidateFrame) -> Path:
+        """选出发给模型的**图片**路径。
+
+        一个候选帧同时携带两个路径：
+
+        * ``original_path`` —— 源是视频时这里是**视频文件本身**（实测 2.8MB）；
+        * ``extracted_path`` —— 真正抽出来的**关键帧 PNG**（实测 57KB）。
+
+        交通链路 ``traffic_cv_closed_loop/`` 的源是图片目录，两个路径本来就指向
+        同一张图片；但隐患链路的**视频源**下 ``original_path`` 是视频文件，服务端
+        按图片解码会失败并重置连接，客户端只看到一个裸的 ``Connection reset by
+        peer``。实测该端点并无体积限制（8 张帧约 3.8MB 请求体仍返回 HTTP 200），
+        因此这不是「太大」的问题，而是「**根本不是图片**」的问题。
+
+        因此**优先使用关键帧**：``extracted_path`` 非空且指向存在的文件时用它，
+        否则回退到 ``original_path``（保持图片目录场景的既有行为不变）。
+        """
+        extracted_value = getattr(candidate, "extracted_path", "") or ""
+        if extracted_value:
+            extracted = Path(extracted_value)
+            if extracted.is_file():
+                return extracted
+        return Path(candidate.original_path)
+
+    def _ensure_images_are_images(self, image_paths: list[Path]) -> None:
+        """发送前校验每个待发文件**确实是一张图片**（图片魔数），否则明确报错。
+
+        这是私有 VLM 途径的**主护栏**：视频源若误把视频文件（``original_path``）
+        当图片发出，服务端按图片解码失败并重置连接，客户端只看到
+        ``Connection reset by peer``，极难定位。体积无法区分（一个误传的视频与 8 张
+        合法帧体积相同），但**魔数可以** —— 图片的头部签名与 MP4 截然不同。
+
+        该方法**仅在私有 VLM 途径调用**；交通链路 ``openai_compatible`` 保持既有
+        行为不变。
+        """
+        for path in image_paths:
+            try:
+                head = Path(path).read_bytes()[:32]
+            except OSError as error:
+                raise ValueError(f"无法读取待发送的图片 {path}：{error}") from error
+            if _image_format_of(head) is not None:
+                continue
+            raise ValueError(
+                f"待发送的文件不是可识别的图片：{path}（首字节 {head[:12]!r}）。"
+                f"私有 VLM 端点只接受图片（PNG / JPEG / Netpbm 等）；此错误通常意味着"
+                f"把**视频文件**当成了图片发出 —— 视频源应发送抽出的关键帧"
+                f"（extracted_path），而不是视频文件本身（original_path）。"
+            )
+
+    def _ensure_request_within_limit(
+        self, payload: dict[str, Any], image_paths: list[Path]
+    ) -> None:
+        """可选的**绝对体积上限**校验（默认关闭）。
+
+        阈值口径是「序列化后的 HTTP 请求体字节数」，不是图片原始字节 —— 图片会被
+        base64 编码（膨胀约 4/3）后再放进 JSON。这里直接测量
+        ``len(json.dumps(payload).encode("utf-8"))``，与 ``_post_json`` 实际发出的
+        body 完全一致。
+
+        阈值取配置项 ``qwen.max_request_bytes``，**默认
+        :data:`DEFAULT_MAX_REQUEST_BYTES` = 0（不设上限）** —— 实测该端点并无体积
+        限制，按体积拦截只会误伤合法的多图请求。``<= 0`` 即关闭（即默认行为）。
+
+        该方法**仅在私有 VLM 途径调用**；交通链路 ``openai_compatible`` 保持既有
+        行为不变。
+        """
+        limit = int(getattr(self.config, "qwen_max_request_bytes", DEFAULT_MAX_REQUEST_BYTES) or 0)
+        if limit <= 0:
+            return
+        body_size = len(json.dumps(payload).encode("utf-8"))
+        if body_size <= limit:
+            return
+
+        image_detail = ", ".join(
+            f"{path}（{path.stat().st_size if path.is_file() else '缺失'} 字节）"
+            for path in image_paths
+        )
+        raise ValueError(
+            f"请求体大小 {body_size} 字节，超过配置的绝对上限 {limit} 字节"
+            f"（qwen.max_request_bytes，默认 0 = 不限制）。"
+            f"参与编码的图片：{image_detail}。"
+            f"若确需发送更多/更大的帧，请调高或清零 qwen.max_request_bytes。"
+        )
+
     def _resolve_api_key(self) -> str:
         """按「环境变量 → token 文件」的顺序取 token。
 
@@ -685,7 +822,7 @@ class OpenAICompatibleQwenAnnotator:
         candidate: CandidateFrame,
         prompt_text: str,
     ) -> tuple[list[Detection], dict[str, Any]]:
-        content, base_payload = self._request(prompt_text, Path(candidate.original_path))
+        content, base_payload = self._request(prompt_text, self._image_path_for(candidate))
         try:
             parsed_payload = self.parser.parse(content)
         except (ValueError, json.JSONDecodeError) as error:
@@ -703,7 +840,7 @@ class OpenAICompatibleQwenAnnotator:
         candidate: CandidateFrame,
         prompt_text: str,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        content, base_payload = self._request(prompt_text, Path(candidate.original_path))
+        content, base_payload = self._request(prompt_text, self._image_path_for(candidate))
         try:
             parsed_payload = self.parser.parse(content)
         except (ValueError, json.JSONDecodeError) as error:
@@ -721,7 +858,7 @@ class OpenAICompatibleQwenAnnotator:
         candidate: CandidateFrame,
         prompt_text: str,
     ) -> tuple[list[Detection], dict[str, Any], dict[str, Any]]:
-        content, base_payload = self._request(prompt_text, Path(candidate.original_path))
+        content, base_payload = self._request(prompt_text, self._image_path_for(candidate))
         try:
             parsed_payload = self.parser.parse(content)
         except (ValueError, json.JSONDecodeError) as error:
@@ -832,6 +969,10 @@ class PrivateVlmAnnotator(OpenAICompatibleQwenAnnotator):
         payload, request_preview = self._build_request_payload_multi(
             prompt_text, image_paths
         )
+        # 主护栏：确认待发文件**确实是图片**（图片魔数），挡住「误把视频当图片发出」
+        # 这类失败（服务端会重置连接）。可选的体积上限默认关闭，见下。
+        self._ensure_images_are_images(image_paths)
+        self._ensure_request_within_limit(payload, image_paths)
 
         started = time.perf_counter()
         response_payload = self._post_json(payload=payload, headers=headers)

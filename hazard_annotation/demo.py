@@ -13,9 +13,23 @@ from pathlib import Path
 from typing import Any
 
 from traffic_cv_closed_loop.config import ProjectConfig
-from traffic_cv_closed_loop.io_utils import write_json, write_text
+from traffic_cv_closed_loop.io_utils import iter_image_files, write_json, write_text
 
-# Object tuple: (label, bbox, confidence)
+#: Edge length (px) of the synthetic mock frames.
+#:
+#: Must stay **>= 10**: Ultralytics discards any image whose shorter side is under
+#: 10 px ("ignoring corrupt image/label: image size (4, 4) <10 pixels"), which
+#: would empty the train split and abort with ``No labels found``. 64 px gives a
+#: comfortable margin while keeping the committed ``.ppm`` fixtures small. Each
+#: frame is a solid colour, so resizing does not change any semantics: the
+#: normalised bboxes and the sidecars are unaffected.
+MOCK_FRAME_SIZE: int = 64
+
+#: Ultralytics' minimum image edge length (``ultralytics/data/utils.py``).
+#: A mock frame below this is unusable for training and must be regenerated.
+ULTRALYTICS_MIN_PIXELS: int = 10
+
+#: Object tuple: (label, bbox, confidence)
 _BBOX = {
     "crane": (0.05, 0.05, 0.95, 0.35),
     "hook": (0.45, 0.30, 0.55, 0.42),
@@ -51,7 +65,12 @@ def _render_objects(*names: str) -> list[dict[str, Any]]:
     return rendered
 
 
-def _ppm(path: Path, rgb: tuple[int, int, int], size: int = 4) -> None:
+def _ppm(path: Path, rgb: tuple[int, int, int], size: int = MOCK_FRAME_SIZE) -> None:
+    """Write a solid-colour P3 PPM frame of ``size`` x ``size`` pixels.
+
+    Solid colour is intentional: the frame's semantics live entirely in the
+    sidecar (objects + hazard report), and a solid frame resizes losslessly.
+    """
     red, green, blue = rgb
     header = f"P3\n{size} {size}\n255\n"
     row = " ".join(f"{red} {green} {blue}" for _ in range(size))
@@ -193,18 +212,46 @@ def build_mock_assets(project_dir: Path) -> dict[str, Any]:
     return {"frames_root": str(frames_root), "frame_count": created}
 
 
+def _mock_frames_are_trainable(frames_dir: Path) -> bool:
+    """True when every existing mock frame is large enough for Ultralytics.
+
+    The mock frames are **generated build artifacts** (``examples/*/input/`` is
+    git-ignored), so an existing checkout can still hold frames produced by an
+    older, undersized generator. Those are unusable for real training, hence
+    this staleness check drives a regeneration.
+    """
+    from hazard_annotation.imageio import load_image
+
+    images = iter_image_files(frames_dir)
+    if not images:
+        return False
+    for path in images:
+        try:
+            image = load_image(path)
+        except (ValueError, OSError):
+            return False
+        if min(image.width, image.height) < ULTRALYTICS_MIN_PIXELS:
+            return False
+    return True
+
+
 def ensure_mock_assets(config: ProjectConfig) -> dict[str, Any] | None:
     """Build the mock frames/sidecars when running mock mode on an empty project.
 
     Returns the asset summary when assets were (re)created, or ``None`` when the
-    project already contains frames or is not running in mock mode. This lets
-    ``python -m hazard_annotation all --mock`` work end-to-end on a fresh project
-    without a separate ``demo`` invocation.
+    project already contains **usable** frames or is not running in mock mode.
+    This lets ``python -m hazard_annotation all --mock`` work end-to-end on a
+    fresh project without a separate ``demo`` invocation.
+
+    The frames are regenerated when the directory is empty **or** when the
+    existing frames are too small for Ultralytics (stale artifacts from an older
+    generator) — otherwise real training would silently see 0 usable images.
     """
     if config.qwen_provider.lower() != "mock":
         return None
     frames_dir = config.input_frames_dir
-    if frames_dir.exists() and any(path.is_file() for path in frames_dir.rglob("*")):
+    has_frames = frames_dir.exists() and any(path.is_file() for path in frames_dir.rglob("*"))
+    if has_frames and _mock_frames_are_trainable(frames_dir):
         return None
     return build_mock_assets(config.project_dir)
 

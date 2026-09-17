@@ -147,6 +147,9 @@ class HazardDatasetFormatEndToEndTest(unittest.TestCase):
                 self.assertIn(image.suffix.lower(), ULTRALYTICS_IMAGE_SUFFIXES)
                 # The original Netpbm extension must never reach the dataset.
                 self.assertNotEqual(image.suffix.lower(), ".ppm")
+                # And the frame must be big enough for Ultralytics to keep it
+                # (it discards images whose shorter side is under 10 px).
+                self.assertGreaterEqual(min(_png_dimensions(image)), 10, image)
 
             for image in images:
                 relative = image.relative_to(dataset_dir / "images")

@@ -445,6 +445,19 @@ class ProjectConfig:
     #: 传给 ``/api/generate`` 的 ``options`` 块（temperature / max_tokens 等）。
     qwen_options: dict[str, Any] = field(default_factory=dict)
     qwen_stream: bool = False
+    #: 私有 VLM 端点的 **HTTP 请求体（JSON）字节上限**（可选、默认关闭）。
+    #:
+    #: 口径是「序列化后的请求体字节数」，不是图片原始字节 —— 图片会 base64
+    #: 膨胀约 4/3 后再放进 JSON。**默认 ``0`` = 不设上限**：实测该端点并无
+    #: 1MiB 之类的体积限制（1/2/4/8 张帧分别约 0.47/0.95/1.90/3.80MB 请求体
+    #: 均返回 HTTP 200），因此按体积拦截只会拦死**合法的多图请求**。
+    #: 只有部署方确需一个客户端侧的绝对上限时才显式配置；设为 ``0`` 或负数关闭。
+    #:
+    #: 「误把视频文件当图片发出」这一类问题**不由本项负责** —— 它与 8 张合法帧
+    #: 体积相同、无法靠体积区分，改由 ``private_vlm`` 途径的**图片魔数校验**
+    #: 识别（见 ``traffic_cv_closed_loop/adapters/qwen.py``）。
+    #: 仅对 ``private_vlm`` 途径生效；``openai_compatible``（交通链路）保持既有行为。
+    qwen_max_request_bytes: int = 0
     #: 推理途径选择：mock | local_yolo | server_yolo | private_vlm
     inference_backend: str = "mock"
     #: 私有多模态模型的视频时长上限（秒）。超过则按 on_over_limit 处置。
@@ -483,6 +496,12 @@ class ProjectConfig:
         inference_cfg = raw.get("inference", {})
         endpoint_policy_cfg = (
             inference_cfg.get("endpoint_policy", {}) if isinstance(inference_cfg, dict) else {}
+        )
+
+        # 容忍显式的 ``"max_request_bytes": null``：视为未配置，回退默认值（0 = 不限制）。
+        max_request_bytes_raw = qwen_cfg.get("max_request_bytes", None)
+        qwen_max_request_bytes = (
+            0 if max_request_bytes_raw is None else int(max_request_bytes_raw)
         )
 
         train_split = float(pipeline_cfg.get("train_split", 0.7))
@@ -631,6 +650,7 @@ class ProjectConfig:
             qwen_images_mode=str(qwen_cfg.get("images_mode", "array")),
             qwen_options=_json_dict(qwen_cfg.get("options")),
             qwen_stream=bool(qwen_cfg.get("stream", False)),
+            qwen_max_request_bytes=qwen_max_request_bytes,
             inference_backend=str(inference_cfg.get("backend", "mock")),
             inference_max_video_seconds=float(inference_cfg.get("max_video_seconds", 60.0)),
             inference_on_over_limit=str(inference_cfg.get("on_over_limit", "reject")),
@@ -659,6 +679,10 @@ class ProjectConfig:
             raise ValueError("qwen.timeout_seconds must be >= 1")
         if self.qwen_images_mode not in ("array", "comma_joined"):
             raise ValueError("qwen.images_mode must be 'array' or 'comma_joined'")
+        if self.qwen_max_request_bytes < 0:
+            raise ValueError(
+                "qwen.max_request_bytes must be >= 0 (0 = no ceiling, which is the default)"
+            )
         if self.inference_backend not in ("mock", "local_yolo", "server_yolo", "private_vlm"):
             raise ValueError(
                 "inference.backend must be one of mock / local_yolo / server_yolo / private_vlm"
@@ -902,6 +926,7 @@ class ProjectConfig:
             "qwen_json_repair": self.qwen_json_repair,
             "qwen_combined_call": self.qwen_combined_call,
             "qwen_concurrency": self.qwen_concurrency,
+            "qwen_max_request_bytes": self.qwen_max_request_bytes,
             "yolo_binary": self.yolo_binary,
             "yolo_task": self.yolo_task,
             "yolo_detector": self.yolo_detector,
