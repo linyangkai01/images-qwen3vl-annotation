@@ -78,6 +78,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="train / all 阶段真正调用外部 yolo CLI 训练。",
     )
     parser.add_argument(
+        "--no-resume",
+        dest="no_resume",
+        action="store_true",
+        help=(
+            "关闭抽帧断点续跑，强制全量重算。"
+            "默认开启续跑：输入与抽帧配置都没变的 source 会直接复用已有结果。"
+        ),
+    )
+    parser.add_argument(
         "--image",
         help="probe-qwen / probe-inference 阶段可指定测试图片。",
     )
@@ -118,10 +127,11 @@ def _run_status(config: Any) -> dict[str, Any]:
 
 
 def run_stage(config: Any, args: argparse.Namespace, stage: str) -> dict[str, Any]:
+    resume = not bool(getattr(args, "no_resume", False))
     if stage == "extract":
         from hazard_annotation.pipeline.extraction import run_extraction
 
-        return {"extract": run_extraction(config)}
+        return {"extract": run_extraction(config, resume=resume)}
     if stage == "annotate":
         from hazard_annotation.pipeline.annotation import run_annotation
 
@@ -146,7 +156,7 @@ def run_stage(config: Any, args: argparse.Namespace, stage: str) -> dict[str, An
         from hazard_annotation.pipeline.visualization import run_visualize
 
         payload: dict[str, Any] = {}
-        payload["extract"] = run_extraction(config)
+        payload["extract"] = run_extraction(config, resume=resume)
         payload["annotate"] = run_annotation(config)
         payload["aggregate"] = run_aggregate(config)
         payload["train"] = run_training(config, execute_trainer=args.execute_trainer)

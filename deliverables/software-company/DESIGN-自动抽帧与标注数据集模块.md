@@ -49,10 +49,21 @@
 - 实现：`hazard_annotation/keyframes.py`
 - 参数全部暴露到配置的 `keyframe` 段
 
-**F1.3 抽帧断点续跑** —— **新增（重要缺口）**
-- 现状：`extraction.py` 只有 2 个函数，**没有 resume 逻辑**（`annotation.py` 有，抽帧没有）
-- 需求：长视频抽帧中断后重跑，已完成的分片不重复计算
-- 实现建议：按 source 分片落盘 + `extracted/.progress.json` 记录已完成分片
+**F1.3 抽帧断点续跑** —— **✅ 已实现（2026-09-17）**
+- 原状：`extraction.py` 只有 2 个函数，**没有 resume 逻辑**（`annotation.py` 有，抽帧没有）
+- 实现：新增 `hazard_annotation/checkpoint.py`，按 **source 粒度**做断点
+  - 每个 source 抽完 → 分片落盘 `extracted/.parts/<source>.jsonl` + 进度登记 `extracted/.progress.json`
+  - 重跑时先比指纹；一致且分片在 → 直接复用，跳过抽帧
+- **两层指纹，缺一不可**：
+  - **配置指纹** —— 覆盖所有影响抽帧结果的配置项（labels / video / keyframe / detector）。
+    改一个 `motion_min_ratio` 就整体作废重算
+  - **数据源指纹** —— 覆盖输入本身。刻意**不做全文件哈希**（1 小时视频算 sha256 要几十秒到几分钟），
+    改用「路径 + 大小 + mtime」；图片目录用「文件名 + 大小 + mtime」清单哈希
+- **写入原子化**：临时文件 + `os.replace`，避免中断留下半截 JSON
+- **容错**：断点文件损坏/版本不符 → 不抛异常，退化为全量重算
+- **开关**：`--no-resume` 强制全量重算
+- 验收：连跑两次，第二次复用全部 source；改配置后作废重算；改回后仍重算（分片已被新参数覆盖）；
+  再跑恢复复用。`tests/test_hazard_checkpoint.py` 27 个用例覆盖
 
 **F1.4 抽帧质量报告** —— 已有，需增强
 - 已有 9 项计数：`total_frames / sampled_frames / motion_removed / dedup_removed / scene_cuts / force_kept / protected_dropped / display_missing / final_keyframes`

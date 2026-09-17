@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections import defaultdict
 from pathlib import Path
 
+from hazard_annotation.checkpoint import ExtractionCheckpoint
 from hazard_annotation.inference import (
     check_video_duration,
     render_duration_notice,
@@ -44,13 +45,23 @@ def _discover_sources(config: ProjectConfig) -> tuple[list[KeyframeSource], list
     return sources, warnings
 
 
-def run_extraction(config: ProjectConfig) -> dict[str, object]:
+def run_extraction(config: ProjectConfig, resume: bool = True) -> dict[str, object]:
     ensure_dir(config.extracted_frames_dir)
     ensure_dir(config.status_dir)
 
     detector = build_detector(config)
     extractor = KeyframeExtractor(config, detector=detector)
     sources, warnings = _discover_sources(config)
+
+    # --- 断点续跑：按 source 粒度复用已抽好的结果 ---
+    checkpoint = ExtractionCheckpoint(config, enabled=resume)
+    checkpoint.load()
+    if not resume:
+        print("[断点续跑] 已关闭（--no-resume），本次全量重算")
+    elif checkpoint.invalidation_reason:
+        print(
+            f"[断点续跑] 断点已作废（{checkpoint.invalidation_reason}），本次全量重算"
+        )
 
     # --- 视频时长校验（私有多模态模型算力限制） -------------------------- #
     duration_report = None
@@ -74,11 +85,25 @@ def run_extraction(config: ProjectConfig) -> dict[str, object]:
     records = []
     per_source: dict[str, dict[str, int]] = {}
     for source in sources:
-        source_records = extractor.extract(source)
-        per_source[source.source_id] = dict(extractor.counts)
-        warnings.extend(
-            f"{source.source_id}:{message}" for message in extractor.warnings
-        )
+        if checkpoint.is_reusable(source):
+            source_records = checkpoint.read_records(source.source_id)
+            progress = checkpoint.progress_of(source.source_id)
+            counts = dict(progress.counts) if progress else {}
+            source_warnings = list(progress.warnings) if progress else []
+            checkpoint.reused_sources.append(source.source_id)
+            print(
+                f"[断点续跑] 复用 {source.source_id}："
+                f"{len(source_records)} 张关键帧（输入与配置均未变）"
+            )
+        else:
+            source_records = extractor.extract(source)
+            counts = dict(extractor.counts)
+            source_warnings = list(extractor.warnings)
+            checkpoint.mark_done(source, source_records, counts, source_warnings)
+            checkpoint.recomputed_sources.append(source.source_id)
+
+        per_source[source.source_id] = counts
+        warnings.extend(f"{source.source_id}:{message}" for message in source_warnings)
         records.extend(source_records)
 
     write_jsonl(config.candidates_path, [record.to_dict() for record in records])
@@ -102,6 +127,7 @@ def run_extraction(config: ProjectConfig) -> dict[str, object]:
         "detector_mode": config.yolo_detector,
         "inference_backend": config.inference_backend,
         "video_duration": duration_report.to_dict() if duration_report else None,
+        "checkpoint": checkpoint.summary(),
         "source_count": len(sources),
         "per_source": per_source,
         "totals": totals,
