@@ -247,6 +247,42 @@ class ModelsRoundTripTest(unittest.TestCase):
         self.assertEqual(models.HazardCapability.from_dict({"hazard_id": "D-1-1"}).supported, False)
         self.assertEqual(models.PriorityItem.from_dict({"relative_path": "a"}).score, 0.0)
 
+    def test_to_dict_none_list_dict_fields_do_not_crash(self) -> None:
+        # 缺陷 C：to_dict 侧对 None 列表/字典字段的守卫，须与 from_dict 对称。
+        samples = [
+            models.TemporalFinding(hazard_id="h", source_id="s", finding="f", frame_indices=None),
+            models.RelationFinding(hazard_id="h", relation="r", supporting=None),
+            models.PriorityItem(relative_path="p", reasons=None, signals=None),
+            models.TaxonomyClass(class_id=0, name="person", served_hazards=None),
+            models.EvalReport(dataset_version="v1", per_class=None, tier_verdict=None),
+        ]
+        for sample in samples:
+            with self.subTest(cls=type(sample).__name__):
+                payload = sample.to_dict()  # 不应抛 TypeError
+                # 且与 from_dict 的宽容行为对称：None 回落为空容器。
+                restored = type(sample).from_dict(payload)
+                self.assertEqual(type(sample).from_dict(payload).to_dict(), payload)
+                self.assertIsInstance(restored, type(sample))
+
+    def test_from_dict_none_str_fields_become_empty_not_none_string(self) -> None:
+        # 缺陷 E：str 字段遇 None 回落为 ""，绝不产出 "None" 中间态。
+        asset = models.MediaAsset.from_dict(
+            {"source_id": None, "path": None, "scene": None, "media_type": None}
+        )
+        self.assertEqual(asset.source_id, "")
+        self.assertEqual(asset.path, "")
+        self.assertEqual(asset.scene, "")
+        self.assertEqual(asset.media_type, "")
+        for value in (asset.source_id, asset.path, asset.scene, asset.media_type):
+            self.assertNotEqual(value, "None")
+
+        # 数值 / 布尔字段遇 None 回落默认值（不崩）。
+        asset2 = models.MediaAsset.from_dict({"source_id": "s", "path": "p", "width": None, "fps": None})
+        self.assertEqual(asset2.width, 0)
+        self.assertEqual(asset2.fps, 0.0)
+        self.assertEqual(models.HazardCapability.from_dict({"hazard_id": "h", "supported": None}).supported, False)
+        self.assertEqual(models.HoldoutEntry.from_dict({"dataset_version": "v"}).relative_path, "")
+
 
 if __name__ == "__main__":
     unittest.main()

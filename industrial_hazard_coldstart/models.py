@@ -11,6 +11,9 @@
 约定：
 - 全部字段都有默认值（除少数主键），保证 ``from_dict`` 在缺字段时也能构造；
 - 每个结构都提供 ``to_dict`` / ``from_dict``，且互为逆运算（round-trip 稳定）；
+- **``None`` 守卫对称**：``from_dict`` 对 ``None`` 宽容（str→``""``、list→``[]``、
+  dict→``{}``、数值→默认值），``to_dict`` 对列表/字典字段的 ``None`` 同样回落，
+  两侧行为一致，绝不产出 ``"None"`` 这类中间态；
 - 仅使用 Python 标准库 + 母项目，零新增第三方依赖。
 """
 
@@ -46,22 +49,55 @@ __all__ = [
 ]
 
 
+# --------------------------------------------------------------------------- #
+# 反序列化 / 序列化 的 None 守卫（两侧对称）
+# --------------------------------------------------------------------------- #
+def _str_or_empty(value: Any) -> str:
+    """``None`` → ``""``；否则 ``str(value)``（绝不产出 ``"None"``）。"""
+    return "" if value is None else str(value)
+
+
+def _int_or(value: Any, default: int) -> int:
+    """``None`` → ``default``；否则 ``int(value)``。"""
+    return default if value is None else int(value)
+
+
+def _float_or(value: Any, default: float) -> float:
+    """``None`` → ``default``；否则 ``float(value)``。"""
+    return default if value is None else float(value)
+
+
+def _bool_or(value: Any, default: bool) -> bool:
+    """``None`` → ``default``；否则 ``bool(value)``。"""
+    return default if value is None else bool(value)
+
+
+def _list_or_empty(value: Any) -> list[Any]:
+    """``None`` / 假值 → ``[]``；否则 ``list(value)``（``to_dict`` 侧守卫）。"""
+    return list(value) if value else []
+
+
+def _dict_or_empty(value: Any) -> dict[str, Any]:
+    """``None`` / 假值 → ``{}``；否则 ``dict(value)``（``to_dict`` 侧守卫）。"""
+    return dict(value) if value else {}
+
+
 def _as_dict_list(raw: Any) -> list[dict[str, Any]]:
-    """把任意可迭代对象规整为 ``list[dict]``（非 dict 元素被丢弃）。"""
+    """把任意可迭代对象规整为 ``list[dict]``（``None`` → ``[]``，非 dict 元素被丢弃）。"""
     if not raw:
         return []
     return [dict(item) for item in raw if isinstance(item, dict)]
 
 
 def _as_str_list(raw: Any) -> list[str]:
-    """把任意可迭代对象规整为 ``list[str]``。"""
+    """把任意可迭代对象规整为 ``list[str]``（``None`` → ``[]``）。"""
     if not raw:
         return []
-    return [str(item) for item in raw]
+    return [_str_or_empty(item) for item in raw]
 
 
 def _as_int_list(raw: Any) -> list[int]:
-    """把任意可迭代对象规整为 ``list[int]``。"""
+    """把任意可迭代对象规整为 ``list[int]``（``None`` → ``[]``）。"""
     if not raw:
         return []
     return [int(item) for item in raw]
@@ -101,15 +137,15 @@ class MediaAsset:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MediaAsset":
         return cls(
-            source_id=str(data.get("source_id", "")),
-            path=str(data.get("path", "")),
-            scene=str(data.get("scene", "hoist")),
-            media_type=str(data.get("media_type", "image")),
-            duration_s=float(data.get("duration_s", 0.0)),
-            width=int(data.get("width", 0)),
-            height=int(data.get("height", 0)),
-            fps=float(data.get("fps", 0.0)),
-            count=int(data.get("count", 1)),
+            source_id=_str_or_empty(data.get("source_id", "")),
+            path=_str_or_empty(data.get("path", "")),
+            scene=_str_or_empty(data.get("scene", "hoist")),
+            media_type=_str_or_empty(data.get("media_type", "image")),
+            duration_s=_float_or(data.get("duration_s"), 0.0),
+            width=_int_or(data.get("width"), 0),
+            height=_int_or(data.get("height"), 0),
+            fps=_float_or(data.get("fps"), 0.0),
+            count=_int_or(data.get("count"), 1),
         )
 
     @property
@@ -144,13 +180,13 @@ class KeyframeRecord:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "KeyframeRecord":
         return cls(
-            source_id=str(data.get("source_id", "")),
-            frame_index=int(data.get("frame_index", 0)),
-            timestamp_s=float(data.get("timestamp_s", 0.0)),
-            extracted_path=str(data.get("extracted_path", "")),
-            phash=int(data.get("phash", 0)),
-            motion_ratio=float(data.get("motion_ratio", 0.0)),
-            kept_reason=str(data.get("kept_reason", "")),
+            source_id=_str_or_empty(data.get("source_id", "")),
+            frame_index=_int_or(data.get("frame_index"), 0),
+            timestamp_s=_float_or(data.get("timestamp_s"), 0.0),
+            extracted_path=_str_or_empty(data.get("extracted_path", "")),
+            phash=_int_or(data.get("phash"), 0),
+            motion_ratio=_float_or(data.get("motion_ratio"), 0.0),
+            kept_reason=_str_or_empty(data.get("kept_reason", "")),
         )
 
 
@@ -168,15 +204,15 @@ class TaxonomyClass:
             "class_id": self.class_id,
             "name": self.name,
             "tier": self.tier,
-            "served_hazards": list(self.served_hazards),
+            "served_hazards": _list_or_empty(self.served_hazards),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaxonomyClass":
         return cls(
-            class_id=int(data.get("class_id", 0)),
-            name=str(data.get("name", "")),
-            tier=str(data.get("tier", "")),
+            class_id=_int_or(data.get("class_id"), 0),
+            name=_str_or_empty(data.get("name", "")),
+            tier=_str_or_empty(data.get("tier", "")),
             served_hazards=_as_str_list(data.get("served_hazards")),
         )
 
@@ -201,10 +237,10 @@ class HazardCapability:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "HazardCapability":
         return cls(
-            hazard_id=str(data.get("hazard_id", "")),
-            layer=str(data.get("layer", "")),
-            supported=bool(data.get("supported", False)),
-            notes=str(data.get("notes", "")),
+            hazard_id=_str_or_empty(data.get("hazard_id", "")),
+            layer=_str_or_empty(data.get("layer", "")),
+            supported=_bool_or(data.get("supported"), False),
+            notes=_str_or_empty(data.get("notes", "")),
         )
 
 
@@ -228,10 +264,10 @@ class HoldoutEntry:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "HoldoutEntry":
         return cls(
-            dataset_version=str(data.get("dataset_version", "")),
-            relative_path=str(data.get("relative_path", "")),
-            sha256=str(data.get("sha256", "")),
-            registered_at=str(data.get("registered_at", "")),
+            dataset_version=_str_or_empty(data.get("dataset_version", "")),
+            relative_path=_str_or_empty(data.get("relative_path", "")),
+            sha256=_str_or_empty(data.get("sha256", "")),
+            registered_at=_str_or_empty(data.get("registered_at", "")),
         )
 
 
@@ -248,17 +284,16 @@ class PriorityItem:
         return {
             "relative_path": self.relative_path,
             "score": self.score,
-            "signals": dict(self.signals),
-            "reasons": list(self.reasons),
+            "signals": _dict_or_empty(self.signals),
+            "reasons": _list_or_empty(self.reasons),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "PriorityItem":
-        signals = data.get("signals")
         return cls(
-            relative_path=str(data.get("relative_path", "")),
-            score=float(data.get("score", 0.0)),
-            signals=dict(signals) if isinstance(signals, dict) else {},
+            relative_path=_str_or_empty(data.get("relative_path", "")),
+            score=_float_or(data.get("score"), 0.0),
+            signals=_dict_or_empty(data.get("signals")),
             reasons=_as_str_list(data.get("reasons")),
         )
 
@@ -277,21 +312,19 @@ class EvalReport:
         return {
             "dataset_version": self.dataset_version,
             "holdout_hash": self.holdout_hash,
-            "per_class": dict(self.per_class),
-            "tier_verdict": dict(self.tier_verdict),
+            "per_class": _dict_or_empty(self.per_class),
+            "tier_verdict": _dict_or_empty(self.tier_verdict),
             "consumption_rate": self.consumption_rate,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "EvalReport":
-        per_class = data.get("per_class")
-        tier_verdict = data.get("tier_verdict")
         return cls(
-            dataset_version=str(data.get("dataset_version", "")),
-            holdout_hash=str(data.get("holdout_hash", "")),
-            per_class=dict(per_class) if isinstance(per_class, dict) else {},
-            tier_verdict=dict(tier_verdict) if isinstance(tier_verdict, dict) else {},
-            consumption_rate=float(data.get("consumption_rate", 0.0)),
+            dataset_version=_str_or_empty(data.get("dataset_version", "")),
+            holdout_hash=_str_or_empty(data.get("holdout_hash", "")),
+            per_class=_dict_or_empty(data.get("per_class")),
+            tier_verdict=_dict_or_empty(data.get("tier_verdict")),
+            consumption_rate=_float_or(data.get("consumption_rate"), 0.0),
         )
 
 
@@ -313,18 +346,18 @@ class RelationFinding:
             "hazard_id": self.hazard_id,
             "relation": self.relation,
             "confidence": self.confidence,
-            "supporting": [dict(item) for item in self.supporting],
+            "supporting": [dict(item) for item in _list_or_empty(self.supporting)],
             "notes": self.notes,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RelationFinding":
         return cls(
-            hazard_id=str(data.get("hazard_id", "")),
-            relation=str(data.get("relation", "")),
-            confidence=float(data.get("confidence", 0.0)),
+            hazard_id=_str_or_empty(data.get("hazard_id", "")),
+            relation=_str_or_empty(data.get("relation", "")),
+            confidence=_float_or(data.get("confidence"), 0.0),
             supporting=_as_dict_list(data.get("supporting")),
-            notes=str(data.get("notes", "")),
+            notes=_str_or_empty(data.get("notes", "")),
         )
 
 
@@ -345,17 +378,17 @@ class TemporalFinding:
             "source_id": self.source_id,
             "finding": self.finding,
             "confidence": self.confidence,
-            "frame_indices": list(self.frame_indices),
+            "frame_indices": _list_or_empty(self.frame_indices),
             "notes": self.notes,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TemporalFinding":
         return cls(
-            hazard_id=str(data.get("hazard_id", "")),
-            source_id=str(data.get("source_id", "")),
-            finding=str(data.get("finding", "")),
-            confidence=float(data.get("confidence", 0.0)),
+            hazard_id=_str_or_empty(data.get("hazard_id", "")),
+            source_id=_str_or_empty(data.get("source_id", "")),
+            finding=_str_or_empty(data.get("finding", "")),
+            confidence=_float_or(data.get("confidence"), 0.0),
             frame_indices=_as_int_list(data.get("frame_indices")),
-            notes=str(data.get("notes", "")),
+            notes=_str_or_empty(data.get("notes", "")),
         )

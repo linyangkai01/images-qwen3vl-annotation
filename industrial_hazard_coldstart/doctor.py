@@ -5,10 +5,14 @@
 1. **ffmpeg 可用性** —— 视频抽帧链路依赖的外部二进制；
 2. **VLM 端点（经 lab-server）** —— 只校验配置，**不在本机联网探活**
    （实测本机到端点不可达，调用必须从 ``lab-server`` 发起）；
-3. **端点护栏判定** —— 用母项目 ``endpoint_allowed`` 复算一次放行/拒绝结论；
+3. **端点护栏判定** —— 用母项目 ``endpoint_allowed`` 复算一次放行/拒绝结论，
+   并额外检测**危险组合**：``mode == "local_only"`` 且 ``allowlist`` 非空时给出告警
+   （母项目 ``endpoint_allowed`` 先判白名单命中、后判 mode，故 ``local_only``
+   **并非**最严格档，白名单仍会生效——母项目代码冻结不能改，只能在此告警兜住）；
 4. **holdout 完整性** —— 属 T04.2，本批（T01）**尚未实现**，如实标注而非假装通过。
 
-设计立场：**依赖尚未实现时给出「尚未实现」，绝不假装通过**。
+设计立场：**依赖尚未实现时给出「尚未实现」，绝不假装通过**；
+危险但非阻塞的组合放入 ``warnings``，不混进阻塞项 ``issues``。
 """
 
 from __future__ import annotations
@@ -24,6 +28,14 @@ __all__ = ["probe_ffmpeg", "build_hoist_doctor_report"]
 
 #: 探活 ffmpeg 的短超时（秒），避免 doctor 卡死。
 _FFMPEG_PROBE_TIMEOUT_S = 10
+
+#: ``local_only`` 与白名单并存时的告警（母项目护栏可被残留白名单绕过，冻结不改）。
+LOCAL_ONLY_ALLOWLIST_WARNING = (
+    "endpoint_policy.mode=local_only 与 allowlist 同时存在："
+    "母项目 endpoint_allowed() 先判白名单命中、后判 mode，"
+    "因此白名单仍会生效，local_only 并非最严格档。"
+    "若确实只想允许本机/内网，请清空 allowlist。"
+)
 
 
 def probe_ffmpeg(binary: str) -> dict[str, Any]:
@@ -66,6 +78,7 @@ def probe_ffmpeg(binary: str) -> dict[str, Any]:
 def build_hoist_doctor_report(config: ProjectConfig) -> dict[str, Any]:
     """构造吊装链路探活报告（含四项检查）。"""
     issues: list[str] = []
+    warnings: list[str] = []
     pending: list[str] = []
 
     # --- 1. ffmpeg 可用性 ---
@@ -92,15 +105,24 @@ def build_hoist_doctor_report(config: ProjectConfig) -> dict[str, Any]:
         config.inference_endpoint_mode,
         config.inference_endpoint_allowlist,
     )
+    # 危险组合：local_only 与白名单并存时，白名单仍生效（母项目判定顺序所致）。
+    local_only_with_allowlist = (
+        config.inference_endpoint_mode == "local_only"
+        and bool(config.inference_endpoint_allowlist)
+    )
     endpoint_policy = {
         "mode": config.inference_endpoint_mode,
         "allowlist": list(config.inference_endpoint_allowlist),
         "endpoint": config.qwen_chat_endpoint,
         "allowed": allowed,
         "reason": reason,
+        "local_only_with_allowlist": local_only_with_allowlist,
+        "warning": LOCAL_ONLY_ALLOWLIST_WARNING if local_only_with_allowlist else "",
     }
     if not allowed:
         issues.append("endpoint_policy_rejected")
+    if local_only_with_allowlist:
+        warnings.append(LOCAL_ONLY_ALLOWLIST_WARNING)
 
     # --- 4. holdout 完整性（T04.2，本批尚未实现）---
     holdout_index = config.workspace("holdout", "index.json")
@@ -118,6 +140,7 @@ def build_hoist_doctor_report(config: ProjectConfig) -> dict[str, Any]:
     return {
         "status": "issues_found" if issues else "ready",
         "issues": issues,
+        "warnings": warnings,
         "pending": pending,
         "project_name": config.name,
         "config_path": str(config.config_path),

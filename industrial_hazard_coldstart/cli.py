@@ -8,9 +8,12 @@ prioritize / curate / freeze-holdout / train / evaluate / doctor``。
 也让上游编排脚本能立刻发现「该阶段还没接上」。
 
 退出码约定：
-- ``0``：成功；
-- ``1``：``doctor`` 发现阻塞性问题；
-- ``2``：子命令尚未实现（或参数错误）。
+- ``0``：成功 / ``doctor`` 一切就绪；
+- ``1``：``doctor`` 读到配置但发现问题（环境问题）；
+- ``2``：子命令尚未实现（或参数错误）；
+- ``3``：配置**无法读取**（路径不存在 / 非法 JSON / 校验失败）。
+
+``1`` 与 ``3`` 刻意区分：脚本据此能分辨「配置根本读不到」与「配置读到了但环境有问题」。
 """
 
 from __future__ import annotations
@@ -24,6 +27,12 @@ from industrial_hazard_coldstart.doctor import build_hoist_doctor_report
 
 #: 默认配置指向自有吊装子树。
 DEFAULT_CONFIG = "own/hoist_project/config/project.hoist.json"
+
+#: 退出码常量（与文档字符串一致）。
+EXIT_READY = 0
+EXIT_ISSUES = 1
+EXIT_NOT_IMPLEMENTED = 2
+EXIT_CONFIG_UNREADABLE = 3
 
 #: 尚未实现的子命令 → 计划落地的子任务（用于给出可操作的提示）。
 _PENDING_COMMANDS: dict[str, str] = {
@@ -57,6 +66,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="industrial-hazard-coldstart",
         description="工业隐患单场景（吊装）YOLO 冷启动标注与训练。",
+        epilog=(
+            "退出码：0=就绪；1=doctor 发现问题；"
+            "2=子命令尚未实现/参数错误；3=配置无法读取。"
+        ),
     )
     parser.add_argument(
         "--config",
@@ -93,6 +106,17 @@ def _pending_message(command: str) -> str:
     )
 
 
+def _config_error_message(config_path: str, error: Exception) -> str:
+    """把配置读取失败转成可读的中文错误（不打印栈）。"""
+    return (
+        f"错误：无法读取配置文件 {config_path}\n"
+        f"原因：{error}\n"
+        "提示：请确认 --config 指向的文件存在、是合法 JSON，且通过 ProjectConfig 校验。\n"
+        f"（退出码 {EXIT_CONFIG_UNREADABLE} = 配置无法读取，与退出码 "
+        f"{EXIT_ISSUES} = doctor 发现问题 区分。）"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """命令行主入口，返回进程退出码。"""
     parser = _build_parser()
@@ -102,14 +126,20 @@ def main(argv: list[str] | None = None) -> int:
         # 延迟 import，避免 ``import industrial_hazard_coldstart`` 时拉起母项目配置。
         from traffic_cv_closed_loop.config import ProjectConfig
 
-        config = ProjectConfig.load(args.config)
+        try:
+            config = ProjectConfig.load(args.config)
+        except (FileNotFoundError, ValueError, json.JSONDecodeError, OSError) as error:
+            # 配置读不到 → 可读错误 + 专用退出码，绝不抛栈。
+            print(_config_error_message(str(args.config), error), file=sys.stderr)
+            return EXIT_CONFIG_UNREADABLE
+
         report = build_hoist_doctor_report(config)
         _print_payload(report)
-        return 0 if report["status"] == "ready" else 1
+        return EXIT_READY if report["status"] == "ready" else EXIT_ISSUES
 
     if args.command in _PENDING_COMMANDS:
         print(_pending_message(args.command), file=sys.stderr)
-        return 2
+        return EXIT_NOT_IMPLEMENTED
 
     parser.error(f"Unsupported command: {args.command}")
-    return 2  # pragma: no cover - argparse.error 已抛出 SystemExit
+    return EXIT_NOT_IMPLEMENTED  # pragma: no cover - argparse.error 已抛出 SystemExit
