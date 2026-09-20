@@ -35,7 +35,7 @@ from traffic_cv_closed_loop.config import KeyframeConfig, ProjectConfig
 from traffic_cv_closed_loop.imageio import ImageStats, load_image
 from traffic_cv_closed_loop.io_utils import read_json, read_jsonl
 
-from industrial_hazard_coldstart import video_decode as vd
+from industrial_hazard_coldstart import cli, video_decode as vd
 from industrial_hazard_coldstart.orchestrator import run_cycle
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -104,10 +104,13 @@ def _write_pgm(path: Path, width: int, height: int, value_fn) -> Path:
 
 
 def _make_config(tmp: Path, *, ffmpeg_binary: str | None = None, sample_fps: float = 1.0,
-                 keyframe: dict | None = None) -> ProjectConfig:
+                 keyframe: dict | None = None, provider: str | None = None) -> ProjectConfig:
     raw = json.loads(HOIST_CONFIG.read_text(encoding="utf-8"))
     raw["video"]["ffmpeg_binary"] = ffmpeg_binary if ffmpeg_binary is not None else (FFMPEG or "ffmpeg")
     raw["video"]["sample_fps"] = sample_fps
+    if provider is not None:
+        # 默认配置是 private_vlm（真端点）；离线用例必须显式降级为 mock，绝不联网。
+        raw["qwen"]["provider"] = provider
     if keyframe:
         raw["keyframe"].update(keyframe)
     config_dir = tmp / "config"
@@ -498,9 +501,54 @@ class CliExitCodeTest(unittest.TestCase):
             cwd=str(ROOT), capture_output=True, text=True,
         )
 
-    def test_pending_command_returns_2(self) -> None:
-        result = self._run_cli("--config", str(HOIST_CONFIG), "train")
-        self.assertEqual(result.returncode, 2)
+    def test_pending_commands_return_2(self) -> None:
+        """**未实现**的子命令一律退出 2。
+
+        **断言不变量，不断言快照**：命令名列表**引用** ``cli.PENDING_COMMANDS``
+        （单一真源）而非手抄。阶段转正时只需把命令从 ``cli._PENDING_COMMANDS``
+        移入 ``cli.IMPLEMENTED_COMMANDS``，本用例自动缩短、不会假红——这正是
+        T04 把 ``train`` 转正后本用例必须改写的原因（原用例硬编码 ``train``，
+        转正后实得 4 = 已实现阶段执行失败）。
+
+        同时守护「空集合」退化：若某天全部子命令都已实现，遍历会空转而假绿，
+        故显式断言集合非空，提醒维护者改写本用例。
+        """
+        pending = sorted(cli.PENDING_COMMANDS)
+        self.assertTrue(
+            pending,
+            "PENDING_COMMANDS 为空：所有子命令都已实现，本用例已空转，"
+            "请删掉它并保留 test_implemented_commands_never_return_2。",
+        )
+        for command in pending:
+            with self.subTest(command=command):
+                result = self._run_cli("--config", str(HOIST_CONFIG), command)
+                self.assertEqual(
+                    result.returncode,
+                    cli.EXIT_NOT_IMPLEMENTED,
+                    f"`{command}` 声明为未实现，退出码应为 2；stderr={result.stderr[:300]}",
+                )
+                self.assertIn("尚未实现", result.stderr)
+
+    def test_implemented_commands_never_return_2(self) -> None:
+        """反向不变量：已转正的子命令**绝不能**再返回 2（2 是「尚未实现」专用码）。
+
+        这补上了上一条用例的空档：只遍历 PENDING 无法发现「声明已实现但 CLI 忘了接线」
+        （那会落回 pending 分支返回 2，却没人检查）。命令名同样引用
+        ``cli.IMPLEMENTED_COMMANDS``，阶段新增时自动纳入。
+
+        配置用 **mock provider 的临时工程**（绝不触碰真端点 / 真素材）：因此每个
+        已实现命令要么成功(0/1)、要么执行失败(4)，都不得是 2。
+        """
+        config = _make_config(self.tmp, provider="mock")
+        for command in cli.IMPLEMENTED_COMMANDS:
+            with self.subTest(command=command):
+                result = self._run_cli("--config", str(config.config_path), command)
+                self.assertNotEqual(
+                    result.returncode,
+                    cli.EXIT_NOT_IMPLEMENTED,
+                    f"`{command}` 已声明实现，却返回了「尚未实现」的退出码 2；"
+                    f"stderr={result.stderr[:300]}",
+                )
 
     def test_missing_config_returns_3(self) -> None:
         result = self._run_cli("--config", str(self.tmp / "nope.json"), "inventory")

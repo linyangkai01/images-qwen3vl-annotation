@@ -59,6 +59,7 @@
     ]
   },
   "knowledge": {
+    "kb_path": "../../hazard-detection/knowledge_base.json",
     "kb_mode": "compressed",
     "kb_max_chars": 8000,
     "scene_routing": "rules",

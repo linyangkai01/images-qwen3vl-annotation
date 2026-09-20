@@ -71,14 +71,51 @@ pwsh -File scripts/run_hoist_cycle.ps1
 ```
 
 ```bash
-# lab-server（Linux）全量：完整链路（当前 T03–T05 未实现，会明确报「尚未实现」）
+# lab-server（Linux）全量：完整链路（当前仅 T05 `evaluate` 未实现）
 bash scripts/run_hoist_cycle.sh
 ```
 
 阶段顺序：`inventory → extract-video → extract → annotate → prioritize →
 curate → freeze-holdout → train → evaluate`（`doctor` 可随时单独跑）。
 
-> 已实现（可跑）：`doctor`、`inventory`、`extract-video`、`extract`（T01–T02）。
-> 仍未实现：`annotate / prioritize / curate / freeze-holdout / train / evaluate`
-> —— CLI 会明确报「尚未实现」并返回退出码 `2`，**绝不静默成功**。
-> 已实现阶段的执行失败（如 ffmpeg 缺失）返回退出码 `4`。
+> **已实现（可跑）**：`doctor`（T01）、`inventory / extract-video / extract`（T02）、
+> `annotate / prioritize`（T03）、`curate / freeze-holdout / train`（T04）。
+> **仍未实现**：`evaluate`（T05）—— CLI 会明确报「尚未实现」并返回退出码 `2`，
+> **绝不静默成功**。
+
+### 退出码约定
+
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 成功 / `doctor` 一切就绪 |
+| `1` | `doctor` 读到配置但发现问题（环境问题） |
+| `2` | 子命令尚未实现（或参数错误） |
+| `3` | 配置**无法读取**（路径不存在 / 非法 JSON / 校验失败） |
+| `4` | **已实现**阶段的执行失败（如 ffmpeg 缺失、素材缺失） |
+
+`1` 与 `3` 刻意区分（「配置读不到」vs「读到了但环境有问题」）；`2` 与 `4` 区分
+「压根还没实现」与「实现好了但跑失败」。
+
+### T04 新增产物
+
+- `workspace/datasets/<version>/` —— 版本化数据集：`data.yaml` / `manifest.json` /
+  `class_histogram.json` / `quality_report.json` / `summary.json`；
+- `workspace/holdout/` —— 固定 holdout：`index.json`（冻结清单 + 每帧 sha256）
+  + `frames/` + `labels/`（冻结副本）。**跨版本共享**（与 `<version>` 无关）；
+- `workspace/runs/<version>/` —— 训练产物：`report.json` / `metrics.json` /
+  `command.txt`（`UltralyticsTrainer` 在 `execute=False` 时只准备命令）。
+
+### holdout 铁律（跨轮可比的前提）
+
+`workspace/holdout/index.json` **一旦存在即视为「已冻结」**，后续轮次一律**读回**
+该清单、**绝不重新切分**——即便传入不同的 `--version` / `--holdout-ratio` / 随机种子，
+即便首轮冻结的是空集合。新增记录只能进 `train` / `val`。`verify_holdout`
+重算每帧 sha256，可检出**内容被篡改**与**文件被删**两种情况；`doctor` 也会给出
+holdout 的真实完整性结论（`ok` / `tampered` / `missing` / `not_frozen`）。
+
+### 数据集版本号规则
+
+版本号由**调用方指定**（`--version`），**不是时间戳**——因为「跨轮可比」是硬要求
+（时间戳版本号每轮都不同，无法跨轮对比指标）。版本号**不得**含 `/`、`\`、`..`
+或为绝对路径：它会被拼进 `workspace/datasets/<version>/`，并在同名重建时 `rmtree`，
+故 CLI 对其 **fail-loud** 校验，绝不静默越界删除。

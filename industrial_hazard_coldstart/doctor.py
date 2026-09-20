@@ -9,7 +9,9 @@
    并额外检测**危险组合**：``mode == "local_only"`` 且 ``allowlist`` 非空时给出告警
    （母项目 ``endpoint_allowed`` 先判白名单命中、后判 mode，故 ``local_only``
    **并非**最严格档，白名单仍会生效——母项目代码冻结不能改，只能在此告警兜住）；
-4. **holdout 完整性** —— 属 T04.2，本批（T01）**尚未实现**，如实标注而非假装通过。
+4. **holdout 完整性**（T04.2 已实现）—— 若 ``workspace/holdout/index.json`` 存在，
+   读回冻结清单并重算每帧 sha256，给出**真实结论**（``ok`` / ``tampered`` / ``missing``）；
+   若尚未冻结则报 ``not_frozen``。**绝不**再假装「尚未实现」。
 
 设计立场：**依赖尚未实现时给出「尚未实现」，绝不假装通过**；
 危险但非阻塞的组合放入 ``warnings``，不混进阻塞项 ``issues``。
@@ -23,6 +25,12 @@ from pathlib import Path
 from typing import Any
 
 from traffic_cv_closed_loop.config import ProjectConfig, endpoint_allowed
+
+from industrial_hazard_coldstart.holdout import (
+    holdout_dir_of,
+    load_holdout_entries,
+    verify_holdout,
+)
 
 __all__ = ["probe_ffmpeg", "build_hoist_doctor_report"]
 
@@ -124,18 +132,56 @@ def build_hoist_doctor_report(config: ProjectConfig) -> dict[str, Any]:
     if local_only_with_allowlist:
         warnings.append(LOCAL_ONLY_ALLOWLIST_WARNING)
 
-    # --- 4. holdout 完整性（T04.2，本批尚未实现）---
+    # --- 4. holdout 完整性（T04.2 已实现：读回冻结清单 + 重算 sha256）---
     holdout_index = config.workspace("holdout", "index.json")
-    holdout = {
-        "status": "not_implemented",
-        "detail": (
-            "固定 holdout 冻结与 sha256 登记属 T04.2，本批（T01）尚未实现，"
-            "无法校验完整性——此处如实标注，不假装通过。"
-        ),
-        "index_path": str(holdout_index),
-        "index_exists": holdout_index.exists(),
-    }
-    pending.append("holdout_not_implemented")
+    if holdout_index.exists():
+        holdout_dir = holdout_dir_of(config)
+        entries = load_holdout_entries(holdout_dir)
+        verification = verify_holdout(entries, holdout_dir)
+        if verification["hash_ok"]:
+            holdout_status = "ok"
+            detail = (
+                f"固定 holdout 已冻结且逐字节校验通过"
+                f"（{verification['verified']}/{verification['total']} 帧）。"
+            )
+        elif verification["tampered"]:
+            holdout_status = "tampered"
+            detail = (
+                f"固定 holdout 完整性受损：{len(verification['tampered'])} 帧内容被篡改。"
+            )
+        else:
+            holdout_status = "missing"
+            detail = (
+                f"固定 holdout 完整性受损：{len(verification['missing'])} 帧缺失。"
+            )
+        holdout = {
+            "status": holdout_status,
+            "detail": detail,
+            "index_path": str(holdout_index),
+            "index_exists": True,
+            "total": verification["total"],
+            "verified": verification["verified"],
+            "tampered": verification["tampered"],
+            "missing": verification["missing"],
+            "hash_ok": verification["hash_ok"],
+        }
+        if not verification["hash_ok"]:
+            issues.append("holdout_integrity_broken")
+    else:
+        holdout = {
+            "status": "not_frozen",
+            "detail": (
+                "尚未冻结固定 holdout（index.json 不存在）；"
+                "请先运行 `train` / `dataset` 阶段完成首次冻结。"
+            ),
+            "index_path": str(holdout_index),
+            "index_exists": False,
+            "total": 0,
+            "verified": 0,
+            "tampered": [],
+            "missing": [],
+            "hash_ok": None,
+        }
 
     return {
         "status": "issues_found" if issues else "ready",

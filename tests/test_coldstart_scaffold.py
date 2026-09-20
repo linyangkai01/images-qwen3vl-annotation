@@ -4,7 +4,7 @@
 - ``--help`` 可用；
 - 未实现子命令返回**非 0** 退出码且打印明确提示（不得静默成功）；
 - ``doctor`` 报告含四项检查（ffmpeg / VLM 端点 / 端点护栏 / holdout），
-  且 holdout 如实标注「尚未实现」；
+  且 holdout 如实标注**真实**状态（T04.2 已实现：未冻结 / 已冻结校验结论）；
 - 吊装提示词能被母项目 ``render_annotation_prompt`` 成功渲染（花括号已转义）。
 """
 
@@ -80,12 +80,16 @@ class DoctorReportTest(unittest.TestCase):
             {"ffmpeg", "vlm_endpoint", "endpoint_policy", "holdout"},
         )
 
-    def test_holdout_is_marked_not_implemented(self) -> None:
+    def test_holdout_reports_real_status(self) -> None:
         config = ProjectConfig.load(HOIST_CONFIG)
         report = build_hoist_doctor_report(config)
-        # holdout 属 T04.2，本批未实现 → 必须如实标注，不得假装通过。
-        self.assertEqual(report["checks"]["holdout"]["status"], "not_implemented")
-        self.assertIn("holdout_not_implemented", report["pending"])
+        # T04.2 已实现：holdout 检查必须给出**真实**状态，不得再假装「尚未实现」。
+        # 本工程尚未冻结 holdout（无 index.json）→ 状态应为 not_frozen；
+        # 已冻结工程则为 ok / tampered / missing（见 doctor 的实现与 T04 独立验证）。
+        status = report["checks"]["holdout"]["status"]
+        self.assertIn(status, {"ok", "tampered", "missing", "not_frozen"})
+        self.assertNotEqual(status, "not_implemented")
+        self.assertNotIn("holdout_not_implemented", report["pending"])
 
     def test_endpoint_policy_guard_is_allowlisted(self) -> None:
         config = ProjectConfig.load(HOIST_CONFIG)

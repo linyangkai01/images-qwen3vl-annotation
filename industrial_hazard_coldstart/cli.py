@@ -4,7 +4,8 @@
 prioritize / curate / freeze-holdout / train / evaluate / doctor``。
 
 **已实现**：``doctor``（T01）、``inventory / extract-video / extract``（T02）、
-``annotate / prioritize``（T03，接线到 :func:`orchestrator.run_cycle`）。
+``annotate / prioritize``（T03）、``curate / freeze-holdout``（T04.1 / T04.2）、
+``train``（T04.3）——数据阶段均接线到 :func:`orchestrator.run_cycle`。
 **仍未实现**的子命令一律打印明确的「尚未实现」提示并返回**非 0** 退出码（``2``），
 **绝不静默成功**——既保证 ``--help`` 可用，也让上游编排脚本能立刻发现「该阶段还没接上」。
 
@@ -50,14 +51,14 @@ IMPLEMENTED_COMMANDS: tuple[str, ...] = (
     "extract",
     "annotate",
     "prioritize",
+    "curate",
+    "freeze-holdout",
+    "train",
 )
 
 #: 尚未实现的子命令 → 计划落地的子任务（用于给出可操作的提示）。
 #: **每实现一个阶段，就把对应条目从这里移入 :data:`IMPLEMENTED_COMMANDS`。**
 _PENDING_COMMANDS: dict[str, str] = {
-    "curate": "T04.1（质量过滤与版本化数据集 F8）",
-    "freeze-holdout": "T04.2（固定 holdout 冻结）",
-    "train": "T04.3（YOLO 冷启动训练 F9）",
     "evaluate": "T05.1（固定 holdout 逐类评估 F10）",
 }
 
@@ -117,6 +118,26 @@ def _build_parser() -> argparse.ArgumentParser:
     for command, help_text in _COMMAND_HELP.items():
         command_parser = subparsers.add_parser(command, help=help_text)
         add_config_argument(command_parser)
+        # 版本号由调用方指定（不用时间戳）→ 跨轮可比；holdout 占比同理。
+        # 这三个阶段都产出 / 消费版本化数据集与固定 holdout。
+        if command in {"curate", "freeze-holdout", "train"}:
+            command_parser.add_argument(
+                "--version",
+                default=argparse.SUPPRESS,
+                help="数据集 / 运行版本号（默认 coldstart-v1，非时间戳）。",
+            )
+            command_parser.add_argument(
+                "--holdout-ratio",
+                type=float,
+                default=argparse.SUPPRESS,
+                help="首次冻结 holdout 的占比（默认 0.2）。",
+            )
+        if command == "train":
+            command_parser.add_argument(
+                "--execute",
+                action="store_true",
+                help="真正执行训练（默认只准备命令 / 走 mock）。",
+            )
 
     return parser
 
@@ -222,8 +243,19 @@ def main(argv: list[str] | None = None) -> int:
         # 延迟 import，避免 ``import industrial_hazard_coldstart`` 时拉起视频解码链路。
         from industrial_hazard_coldstart.orchestrator import run_cycle
 
+        # 仅 ``train`` 携带可选的版本 / holdout / execute 参数（其它阶段没有这些开关）。
+        stage_kwargs: dict[str, Any] = {}
+        version_arg = getattr(args, "version", None)
+        if version_arg is not None:
+            stage_kwargs["version"] = version_arg
+        holdout_ratio_arg = getattr(args, "holdout_ratio", None)
+        if holdout_ratio_arg is not None:
+            stage_kwargs["holdout_ratio"] = holdout_ratio_arg
+        if getattr(args, "execute", False):
+            stage_kwargs["execute"] = True
+
         try:
-            payload = run_cycle(config, args.command)
+            payload = run_cycle(config, args.command, **stage_kwargs)
         except Exception as error:  # noqa: BLE001 - 阶段失败 → 可读错误 + 专用退出码
             print(_stage_error_message(args.command, error), file=sys.stderr)
             return EXIT_STAGE_FAILED

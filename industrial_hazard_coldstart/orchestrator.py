@@ -12,7 +12,10 @@
   随后对模型返回的隐患做**受控词表校验 + 本地 KB 回填**，产出
   ``workspace/hazards/report.json``；
 - ``prioritize``（T03.4）—— 对标注记录做不确定性采样，产出
-  ``workspace/review/priority_queue.jsonl``。
+  ``workspace/review/priority_queue.jsonl``；
+- ``curate``（T04.1）—— 质量过滤 + 版本化数据集构建（:func:`run_curate`）；
+- ``freeze-holdout``（T04.2）—— 冻结 / 读回固定 holdout（:func:`run_freeze_holdout`）；
+- ``train``（T04.3）—— 版本化数据集 + 固定 holdout 上的冷启动训练（:func:`run_train`）。
 
 **串联逻辑**：``extract`` 阶段默认先确保关键帧已就位——若 ``input_frames_dir``
 尚无任何图片且能发现视频，则自动先跑一遍 ``extract-video``，再调
@@ -29,8 +32,10 @@ from pathlib import Path
 from typing import Any
 
 from traffic_cv_closed_loop.adapters.qwen import MockQwenAnnotator, build_qwen_annotator
+from traffic_cv_closed_loop.adapters.yolo import build_trainer
 from traffic_cv_closed_loop.config import ProjectConfig
 from traffic_cv_closed_loop.io_utils import (
+    ensure_dir,
     iter_image_files,
     read_json,
     read_jsonl,
@@ -43,6 +48,16 @@ from traffic_cv_closed_loop.pipeline.annotation import run_annotation
 from traffic_cv_closed_loop.pipeline.extraction import run_extraction
 
 from industrial_hazard_coldstart.active_learning import build_priority_queue
+from industrial_hazard_coldstart.dataset import build_dataset, curate_records
+from industrial_hazard_coldstart.holdout import (
+    DEFAULT_HOLDOUT_RATIO,
+    freeze_holdout,
+    holdout_dir_of,
+    holdout_hash_of,
+    holdout_index_path,
+    validate_holdout_ratio,
+    verify_holdout,
+)
 from industrial_hazard_coldstart.inventory import run_inventory
 from industrial_hazard_coldstart.knowledge import (
     backfill_hazards,
@@ -53,7 +68,18 @@ from industrial_hazard_coldstart.knowledge import (
 )
 from industrial_hazard_coldstart.video_decode import discover_videos, run_video_extract
 
-__all__ = ["SUPPORTED_STAGES", "run_cycle", "run_annotate", "run_prioritize"]
+__all__ = [
+    "SUPPORTED_STAGES",
+    "run_cycle",
+    "run_annotate",
+    "run_prioritize",
+    "run_curate",
+    "run_freeze_holdout",
+    "run_train",
+]
+
+#: 默认数据集版本号（版本号**不用时间戳**，保证跨轮可比）。
+DEFAULT_DATASET_VERSION: str = "coldstart-v1"
 
 #: 本批实现的阶段名。
 SUPPORTED_STAGES: tuple[str, ...] = (
@@ -62,6 +88,9 @@ SUPPORTED_STAGES: tuple[str, ...] = (
     "extract",
     "annotate",
     "prioritize",
+    "curate",
+    "freeze-holdout",
+    "train",
 )
 
 #: 隐患被拒（KB 外 / 场景外）时写入复核队列的原因标记。
@@ -402,6 +431,191 @@ def run_prioritize(config: ProjectConfig, top_k: int | None = 0) -> dict[str, An
     return summary
 
 
+# --------------------------------------------------------------------------- #
+# curate / freeze-holdout 阶段（T04.1 / T04.2）
+# --------------------------------------------------------------------------- #
+def run_curate(
+    config: ProjectConfig,
+    version: str | None = None,
+    holdout_ratio: float = DEFAULT_HOLDOUT_RATIO,
+    quality_thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """执行 ``curate`` 阶段：质量过滤 + 版本化数据集构建（T04.1）。
+
+    复用 :func:`dataset.build_dataset`（其内部已包含固定 holdout 的冻结 / 读回），
+    因此 ``curate`` 与 ``train`` 产出的数据集口径完全一致。版本号由调用方指定
+    （**非时间戳**）→ 跨轮可比。
+
+    Args:
+        config: 项目配置。
+        version: 数据集版本号；省略时用 :data:`DEFAULT_DATASET_VERSION`。
+        holdout_ratio: 首次冻结 holdout 的占比。
+        quality_thresholds: 覆盖默认质量过滤阈值。
+
+    Returns:
+        数据集摘要（含 ``stage: "curate"``）。
+    """
+    dataset_version = (
+        str(version).strip() if version is not None else ""
+    ) or DEFAULT_DATASET_VERSION
+    dataset_summary = build_dataset(
+        config, dataset_version, holdout_ratio, quality_thresholds
+    )
+    summary = {"stage": "curate", **dataset_summary}
+    write_json(config.status_dir / "curate.json", summary)
+    return summary
+
+
+def run_freeze_holdout(
+    config: ProjectConfig,
+    version: str | None = None,
+    holdout_ratio: float = DEFAULT_HOLDOUT_RATIO,
+    quality_thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """执行 ``freeze-holdout`` 阶段：冻结 / 读回固定 holdout（T04.2）。
+
+    - **首次**：从（质量过滤后的）记录里按 ``config.random_seed`` 切出 holdout，
+      逐帧物化冻结副本并登记 sha256；
+    - **之后**：``index.json`` 一旦存在即**读回**，绝不重新切分（holdout 铁律），
+      因此新增记录只会进 train/val，跨轮指标可比。
+
+    与 :func:`run_curate` 共用 :func:`dataset.curate_records` 的质量过滤口径，
+    保证 holdout 候选池与数据集一致。
+
+    Args:
+        config: 项目配置。
+        version: 首次冻结时写入清单的 ``dataset_version`` 标签（可追溯来源）。
+        holdout_ratio: 首次冻结的占比（已冻结时以清单为准）。
+        quality_thresholds: 覆盖默认质量过滤阈值。
+
+    Returns:
+        holdout 摘要（含计数、聚合哈希、是否首次冻结、逐字节校验结论）。
+    """
+    dataset_version = (
+        str(version).strip() if version is not None else ""
+    ) or DEFAULT_DATASET_VERSION
+    holdout_ratio = validate_holdout_ratio(holdout_ratio)
+
+    _, accepted, _, _ = curate_records(config, quality_thresholds)
+
+    out_dir = holdout_dir_of(config)
+    index_path = holdout_index_path(out_dir)
+    already_frozen = index_path.exists()
+    entries = freeze_holdout(
+        accepted,
+        holdout_ratio,
+        config.random_seed,
+        out_dir,
+        version=dataset_version,
+    )
+    verification = verify_holdout(entries, out_dir)
+    summary = {
+        "stage": "freeze-holdout",
+        "dataset_version": dataset_version,
+        "holdout_count": len(entries),
+        "holdout_hash": holdout_hash_of(entries),
+        "holdout_index_path": str(index_path.resolve()),
+        "frozen_dir": str(out_dir.resolve()),
+        "newly_frozen": not already_frozen,
+        "read_back": already_frozen,
+        "hash_ok": verification["hash_ok"],
+        "verified": verification["verified"],
+        "tampered": verification["tampered"],
+        "missing": verification["missing"],
+    }
+    write_json(config.status_dir / "freeze-holdout.json", summary)
+    return summary
+
+
+# --------------------------------------------------------------------------- #
+# train 阶段（T04.3 训练编排）
+# --------------------------------------------------------------------------- #
+def run_train(
+    config: ProjectConfig,
+    version: str | None = None,
+    holdout_ratio: float = DEFAULT_HOLDOUT_RATIO,
+    execute: bool = False,
+    quality_thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """执行 ``train`` 阶段：版本化数据集 + 固定 holdout + YOLO 冷启动训练。
+
+    **关键裁决**：**不**调用母项目 ``run_training``（它每轮用时间戳作版本号并重新切分，
+    会破坏固定 holdout）。改为**细粒度复用**：
+
+    1. :func:`dataset.build_dataset` 自己构建**版本可指定**的数据集，并冻结 / 读回 holdout；
+    2. :func:`traffic_cv_closed_loop.adapters.yolo.build_trainer` 取底层训练器
+       （``MockTrainer`` / ``UltralyticsTrainer``）；
+    3. ``trainer.train(dataset_yaml_path=<我们的 data.yaml>, run_dir=..., execute=...)``
+       —— 只复用其**训练执行能力**，跳过其切分逻辑。
+
+    本机无 ``ultralytics``，只能走 ``MockTrainer``（``execute=False`` 即可端到端跑通）；
+    ``UltralyticsTrainer`` 在 ``execute=False`` 时**只准备命令**（``command.txt``），
+    真实训练在 ``lab-server`` 上以 ``execute=True`` 执行。
+
+    Args:
+        config: 项目配置。
+        version: 数据集 / 运行版本号；省略时用 :data:`DEFAULT_DATASET_VERSION`。
+        holdout_ratio: 首次冻结 holdout 的占比。
+        execute: 是否真正执行训练（``False`` = 只准备 / mock）。
+        quality_thresholds: 覆盖默认质量过滤阈值。
+
+    Returns:
+        训练报告（含数据集摘要、holdout 计数 / 聚合哈希、训练器结果）。
+    """
+    dataset_version = (str(version).strip() if version is not None else "") or DEFAULT_DATASET_VERSION
+    dataset_summary = build_dataset(
+        config,
+        dataset_version,
+        holdout_ratio,
+        quality_thresholds,
+    )
+
+    run_dir = config.runs_dir / dataset_version
+    ensure_dir(run_dir)
+
+    trainer = build_trainer(config)
+    trainer_summary = {
+        "dataset_version": dataset_version,
+        "accepted_images": dataset_summary["accepted"],
+        "split_counts": dataset_summary["split_counts"],
+        "class_histogram": dataset_summary["class_histogram"],
+        "review_queue_count": dataset_summary["review_queue_count"],
+        "fallback_used": False,
+    }
+    trainer_result = trainer.train(
+        config=config,
+        dataset_yaml_path=Path(dataset_summary["data_yaml_path"]),
+        run_dir=run_dir,
+        dataset_summary=trainer_summary,
+        execute=execute,
+    )
+
+    report = {
+        "stage": "train",
+        "project_name": config.name,
+        "dataset_version": dataset_version,
+        "dataset_dir": dataset_summary["dataset_dir"],
+        "data_yaml_path": dataset_summary["data_yaml_path"],
+        "manifest_path": dataset_summary["manifest_path"],
+        "quality_report_path": dataset_summary["quality_report_path"],
+        "run_dir": str(run_dir.resolve()),
+        "detector_mode": config.yolo_detector,
+        "trainer_mode": config.yolo_trainer,
+        "accepted_images": dataset_summary["accepted"],
+        "rejected_images": dataset_summary["rejected"],
+        "split_counts": dataset_summary["split_counts"],
+        "holdout_count": dataset_summary["holdout_count"],
+        "holdout_hash": dataset_summary["holdout_hash"],
+        "holdout_index_path": dataset_summary["holdout_index_path"],
+        "review_queue_count": dataset_summary["review_queue_count"],
+        "class_histogram": dataset_summary["class_histogram"],
+        "trainer": trainer_result,
+    }
+    write_json(run_dir / "report.json", report)
+    write_json(config.status_dir / "train.json", report)
+    return report
+
+
 def run_cycle(
     config: ProjectConfig,
     stage: str,
@@ -409,6 +623,9 @@ def run_cycle(
     video_paths: list[Path] | None = None,
     media_root: Path | None = None,
     auto_extract_video: bool = True,
+    version: str | None = None,
+    holdout_ratio: float | None = None,
+    execute: bool = False,
 ) -> dict[str, Any]:
     """执行一个链路阶段。
 
@@ -418,6 +635,10 @@ def run_cycle(
         video_paths: ``extract-video`` / ``extract`` 使用的显式视频列表。
         media_root: ``inventory`` 使用的素材根目录。
         auto_extract_video: ``extract`` 阶段是否在需要时自动先抽帧。
+        version: ``curate`` / ``freeze-holdout`` / ``train`` 使用的数据集版本号
+            （省略用默认版本）。
+        holdout_ratio: ``curate`` / ``freeze-holdout`` / ``train`` 首次冻结 holdout 的占比。
+        execute: ``train`` 阶段是否真正执行训练。
 
     Returns:
         阶段摘要字典（``extract`` 结果含母项目 ``run_extraction`` 的全部字段）。
@@ -450,6 +671,30 @@ def run_cycle(
 
     if normalized == "prioritize":
         return run_prioritize(config)
+
+    if normalized == "curate":
+        curate_kwargs: dict[str, Any] = {}
+        if version is not None:
+            curate_kwargs["version"] = version
+        if holdout_ratio is not None:
+            curate_kwargs["holdout_ratio"] = holdout_ratio
+        return run_curate(config, **curate_kwargs)
+
+    if normalized == "freeze-holdout":
+        freeze_kwargs: dict[str, Any] = {}
+        if version is not None:
+            freeze_kwargs["version"] = version
+        if holdout_ratio is not None:
+            freeze_kwargs["holdout_ratio"] = holdout_ratio
+        return run_freeze_holdout(config, **freeze_kwargs)
+
+    if normalized == "train":
+        train_kwargs: dict[str, Any] = {"execute": execute}
+        if version is not None:
+            train_kwargs["version"] = version
+        if holdout_ratio is not None:
+            train_kwargs["holdout_ratio"] = holdout_ratio
+        return run_train(config, **train_kwargs)
 
     raise ValueError(
         f"未知阶段：{stage!r}（本批支持：{', '.join(SUPPORTED_STAGES)}）"

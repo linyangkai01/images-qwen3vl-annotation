@@ -20,6 +20,7 @@ import os
 import struct
 import tempfile
 import unittest
+import unittest.mock
 import zlib
 from pathlib import Path
 
@@ -43,6 +44,7 @@ from industrial_hazard_coldstart.knowledge import (
     resolve_hazard,
     severity_rank,
 )
+import industrial_hazard_coldstart.orchestrator as orchestrator
 from industrial_hazard_coldstart.orchestrator import (
     _extract_hazard_from_raw,
     run_cycle,
@@ -762,10 +764,53 @@ class CliExitCodeTest(unittest.TestCase):
         self.assertEqual(self._run(["prioritize", "--config", str(self.config_path)]), cli.EXIT_READY)
 
     def test_unimplemented_stage_exits_two(self) -> None:
-        for command in ("train", "evaluate", "curate", "freeze-holdout"):
+        """**未实现**的阶段一律退出 2。
+
+        **断言不变量，不断言快照**：命令名**引用** ``cli.PENDING_COMMANDS``（单一真源），
+        不手抄列表。原用例硬编码 ``("train", "evaluate", "curate", "freeze-holdout")``，
+        T04 把 ``train`` 转正后即假红（实得 4 = 已实现阶段执行失败）；改为遍历常量后，
+        将来再有阶段转正**无需再改本用例**。
+
+        另加空集合守护：若某天全部子命令都已实现，遍历会空转假绿。
+        """
+        pending = sorted(cli.PENDING_COMMANDS)
+        self.assertTrue(
+            pending,
+            "PENDING_COMMANDS 为空：所有子命令都已实现，本用例已空转，"
+            "请删掉它并保留 test_implemented_stages_are_dispatched。",
+        )
+        for command in pending:
             with self.subTest(command=command):
                 self.assertEqual(self._run([command, "--config", str(self.config_path)]),
                                  cli.EXIT_NOT_IMPLEMENTED)
+
+    def test_implemented_stages_are_dispatched(self) -> None:
+        """反向不变量：已转正的数据阶段必须**真的被派发到编排器**，而非落回 pending 分支。
+
+        手法：把 ``orchestrator.run_cycle`` 替换成抛哨兵异常的探针——若 CLI 把该命令
+        当作「未实现」，它会返回 2 且**不会**调用探针；若正确接线，异常被 CLI 捕获并
+        转成退出码 4（已实现阶段执行失败）且哨兵串出现在 stderr。
+
+        命令名引用 ``cli.DATA_STAGE_COMMANDS``（由 ``IMPLEMENTED_COMMANDS`` 派生），
+        不硬编码；且不触碰网络 / 不产生真实副作用。
+        """
+        sentinel = "STAGE_ROUTING_PROBE_9f3c"
+        for command in cli.DATA_STAGE_COMMANDS:
+            with self.subTest(command=command):
+                stderr = io.StringIO()
+                with unittest.mock.patch.object(
+                    orchestrator, "run_cycle", side_effect=RuntimeError(sentinel)
+                ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                    code = cli.main([command, "--config", str(self.config_path)])
+                self.assertEqual(
+                    code,
+                    cli.EXIT_STAGE_FAILED,
+                    f"`{command}` 声明已实现，应被派发到编排器（失败→4），实得 {code}。",
+                )
+                # 注意：不能用 "尚未实现" 做否定判据——阶段失败提示里会解释
+                # 「与退出码 2 = 尚未实现 区分」，必然含该词。改用 pending 分支独有标记。
+                self.assertNotIn("计划落地于", stderr.getvalue())
+                self.assertIn(sentinel, stderr.getvalue())
 
     def test_prioritize_without_annotate_is_readable_failure(self) -> None:
         stderr = io.StringIO()

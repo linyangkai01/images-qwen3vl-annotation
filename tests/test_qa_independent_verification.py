@@ -410,6 +410,14 @@ class CliAndDoctorTest(unittest.TestCase):
                 self.assertIn("尚未实现", err.getvalue(), f"{command} 未在 stderr 说明")
 
     def test_doctor_report_has_four_checks_and_honest_holdout(self) -> None:
+        """doctor 的四个检查项 + holdout **真实**状态（T04.2 修复后的行为）。
+
+        原 T01 期断言写死 ``status == "not_implemented"`` 且
+        ``"holdout_not_implemented" in pending`` —— 那是 holdout 尚未实现时的占位。
+        T04.2 落地后 ``doctor`` 改为**按实际冻结情况**给出结论，故原断言失效
+        （缺陷 D6）。现改为断言**不变量**：状态取值必须来自真实检查结果集合，
+        且「尚未实现」的占位标记不得再出现。
+        """
         config = ProjectConfig.load(HOIST_CONFIG)
         from industrial_hazard_coldstart.doctor import build_hoist_doctor_report
 
@@ -418,8 +426,12 @@ class CliAndDoctorTest(unittest.TestCase):
             set(report["checks"]),
             {"ffmpeg", "vlm_endpoint", "endpoint_policy", "holdout"},
         )
-        self.assertEqual(report["checks"]["holdout"]["status"], "not_implemented")
-        self.assertIn("holdout_not_implemented", report["pending"])
+        # 不变量：holdout 状态来自真实检查（HOIST_CONFIG 工程未冻结 → not_frozen）。
+        holdout_status = report["checks"]["holdout"]["status"]
+        self.assertNotEqual(holdout_status, "not_implemented")
+        self.assertIn(holdout_status, {"ok", "tampered", "missing", "not_frozen"})
+        # 不变量：占位标记已随 T04.2 落地而移除，不再挂进 pending。
+        self.assertNotIn("holdout_not_implemented", report["pending"])
         # VLM 探活不在本机执行（不联网）。
         self.assertFalse(report["checks"]["vlm_endpoint"]["probed"])
 
