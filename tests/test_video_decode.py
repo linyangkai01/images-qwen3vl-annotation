@@ -590,5 +590,235 @@ class OrchestratorTest(unittest.TestCase):
             run_cycle(config, "definitely-not-a-stage")
 
 
+# --------------------------------------------------------------------------- #
+# 7. probe_video 有效性判定（#2）：图片冒充视频不得被放行为假视频
+# --------------------------------------------------------------------------- #
+def _kf(**overrides) -> KeyframeConfig:
+    """宽松的 ``KeyframeConfig``（默认关闭去重，便于隔离被测维度）。"""
+    base = dict(
+        enable=True,
+        motion_min_ratio=0.0,
+        pixel_delta_threshold=25,
+        dedup_hamming_threshold=-1,
+        phash_size=8,
+        scene_change_threshold=1.1,
+        max_keyframes=1000,
+        min_gap_seconds=0.0,
+    )
+    base.update(overrides)
+    return KeyframeConfig(**base)
+
+
+@requires_ffmpeg
+class ProbeValidityTest(unittest.TestCase):
+    """#2：``probe_video`` 以 ``duration_s`` 为主判据，拒绝图片冒充的视频。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_png_disguised_as_mp4_is_rejected(self) -> None:
+        """一张 PNG 改名成 .mp4：必须 ValueError 拒绝（不得放行为假视频）。"""
+        png = self.tmp / "src.png"
+        png.write_bytes(encode_png(64, 64, bytes([7, 7, 7] * (64 * 64))))
+        fake = self.tmp / "fake.mp4"
+        fake.write_bytes(png.read_bytes())
+
+        with self.assertRaises(ValueError) as ctx:
+            probe_video(fake, FFMPEG)
+        self.assertIn("没有可解码的视频时长", str(ctx.exception))
+
+    def test_single_frame_video_still_accepted(self) -> None:
+        """对照：真正的单帧视频时长 > 0，不得被有效性判定误伤。"""
+        single = self.tmp / "single.mp4"
+        subprocess.run(
+            [FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+             "-i", "testsrc=duration=2:size=160x120:rate=10", "-frames:v", "1",
+             "-pix_fmt", "yuv420p", str(single)],
+            check=True,
+        )
+        info = probe_video(single, FFMPEG)
+        self.assertEqual(info["nb_frames"], 1)
+        self.assertGreater(info["duration_s"], 0.0)
+
+    def test_disguised_video_not_registered_as_fake_fps(self) -> None:
+        """编目层：图片冒充视频不得登记出 ``fps=25、count=0`` 的假视频。"""
+        media = self.tmp / "input" / "media"
+        media.mkdir(parents=True)
+        png = media / "src.png"
+        png.write_bytes(encode_png(32, 32, bytes([3, 3, 3] * (32 * 32))))
+        (media / "fake.mp4").write_bytes(png.read_bytes())
+        config = _make_config(self.tmp, ffmpeg_binary=FFMPEG)
+
+        manifest = run_inventory(config)
+
+        fake_assets = [a for a in manifest["assets"] if a["path"].endswith("fake.mp4")]
+        self.assertEqual(len(fake_assets), 1)
+        asset = fake_assets[0]
+        self.assertEqual(asset["fps"], 0.0)  # 不得为 25.0
+        self.assertEqual(asset["count"], 0)
+        self.assertEqual(asset["duration_s"], 0.0)
+
+
+# --------------------------------------------------------------------------- #
+# 8. 子进程返回码显示为有符号（#3）
+# --------------------------------------------------------------------------- #
+class SignedReturnCodeTest(unittest.TestCase):
+    """#3：负返回码不得显示成 ``4294967274`` 这类无符号数。"""
+
+    def test_negative_codes_are_restored(self) -> None:
+        from industrial_hazard_coldstart.video_decode import _signed_returncode
+
+        self.assertEqual(_signed_returncode(0), 0)
+        self.assertEqual(_signed_returncode(1), 1)
+        self.assertEqual(_signed_returncode(0x7FFFFFFF), 0x7FFFFFFF)
+        # -22（EINVAL）在 Windows 上表现为 4294967274。
+        self.assertEqual(_signed_returncode(4294967274), -22)
+        # -9（SIGKILL）表现为 4294967287。
+        self.assertEqual(_signed_returncode(4294967287), -9)
+        self.assertEqual(_signed_returncode(0x80000000), -2147483648)
+
+
+# --------------------------------------------------------------------------- #
+# 9. dedup_hamming_threshold 三种取值语义（#4）
+# --------------------------------------------------------------------------- #
+class DedupSemanticsTest(unittest.TestCase):
+    """#4：``>0`` 近似判重 / ``=0`` 仅完全相同判重 / ``<0`` 完全关闭。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_three_value_semantics(self) -> None:
+        # 用渐变帧（而非纯色帧）：纯色帧之间 aHash 只差「亮度高位」，距离恒为 1，
+        # 无法体现「>0 近似判重」；渐变帧的距离远大于 4。
+        identical_a = _write_pgm(self.tmp / "d_000000_00000.000.pgm", 16, 16, _gradient(0))
+        identical_b = _write_pgm(self.tmp / "d_000001_00001.000.pgm", 16, 16, _gradient(0))
+        different = _write_pgm(self.tmp / "d_000002_00002.000.pgm", 16, 16, _gradient(120))
+        frames = [identical_a, identical_b, different]
+
+        # >0：近似重复去重。
+        kept_pos = select_keyframes(frames, _kf(dedup_hamming_threshold=4), ImageStats(8))
+        self.assertEqual([r.frame_index for r in kept_pos], [0, 2])
+        # =0：仅完全相同的 aHash 去重（相同帧距离 0 → 仍去重）。
+        kept_zero = select_keyframes(frames, _kf(dedup_hamming_threshold=0), ImageStats(8))
+        self.assertEqual([r.frame_index for r in kept_zero], [0, 2])
+        # <0：完全关闭去重。
+        kept_neg = select_keyframes(frames, _kf(dedup_hamming_threshold=-1), ImageStats(8))
+        self.assertEqual([r.frame_index for r in kept_neg], [0, 1, 2])
+
+    def test_docstring_documents_three_value_semantics(self) -> None:
+        doc = select_keyframes.__doc__ or ""
+        self.assertIn("完全关闭去重", doc)
+        self.assertIn("完全相同", doc)
+        self.assertIn("< 0", doc)
+
+
+# --------------------------------------------------------------------------- #
+# 10. 批量容错（#5）：一个坏视频不得拖垮整批，且绝不静默
+# --------------------------------------------------------------------------- #
+@requires_ffmpeg
+class BatchFaultToleranceTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _good_and_bad(self) -> tuple[Path, Path]:
+        media = self.tmp / "input" / "media"
+        good = _make_video(media / "good.mp4", seconds=6)
+        bad = media / "bad.mp4"
+        bad.write_bytes(b"")  # 0 字节：不可解码
+        return good, bad
+
+    def _config(self) -> ProjectConfig:
+        return _make_config(
+            self.tmp,
+            sample_fps=1.0,
+            keyframe={
+                "max_keyframes": 100,
+                "min_gap_seconds": 0.0,
+                "motion_min_ratio": 0.0,
+                "scene_change_threshold": 1.1,
+            },
+        )
+
+    def test_one_bad_video_does_not_abort_batch(self) -> None:
+        good, bad = self._good_and_bad()
+        config = self._config()
+
+        summary = run_video_extract(config, video_paths=[good, bad])
+
+        self.assertEqual(summary["total_videos"], 2)
+        self.assertEqual(summary["succeeded_videos"], 1)
+        self.assertTrue(summary["has_failures"])
+        self.assertEqual(len(summary["failed_videos"]), 1)
+        self.assertEqual(summary["failed_videos"][0]["source_id"], "bad")
+        # 好视频仍被正常处理（整批未被拖垮）。
+        self.assertGreater(summary["total_kept_frames"], 0)
+        self.assertTrue((config.input_frames_dir / "good").exists())
+
+    def test_partial_failure_is_not_silent_via_summary(self) -> None:
+        """「跳过并记录」而非「悄悄跳过」：失败视频与原因必须在摘要里可见。"""
+        good, bad = self._good_and_bad()
+        summary = run_video_extract(self._config(), video_paths=[good, bad])
+
+        failed = summary["failed_videos"][0]
+        self.assertEqual(set(failed), {"source_id", "video", "error_type", "reason"})
+        self.assertTrue(failed["reason"])  # 原因非空
+
+    def test_partial_failure_cli_returns_4(self) -> None:
+        self._good_and_bad()
+        config = self._config()
+        from industrial_hazard_coldstart.cli import EXIT_STAGE_FAILED, main
+
+        code = main(["--config", str(config.config_path), "extract-video"])
+        self.assertEqual(code, EXIT_STAGE_FAILED)
+
+
+# --------------------------------------------------------------------------- #
+# 11. 编排幂等性（#1 工程师侧镜像）
+# --------------------------------------------------------------------------- #
+@requires_ffmpeg
+class IdempotencyTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_rerun_with_tighter_threshold_removes_stale_keyframes(self) -> None:
+        video = _make_video(self.tmp / "input" / "media" / "clip.mp4", seconds=8)
+        config = _make_config(
+            self.tmp,
+            sample_fps=1.0,
+            keyframe={
+                "max_keyframes": 100,
+                "min_gap_seconds": 0.0,
+                "motion_min_ratio": 0.0,
+                "scene_change_threshold": 1.1,
+            },
+        )
+        run_video_extract(config, video_paths=[video])  # 第一轮：宽松
+        config.keyframe.min_gap_seconds = 4.0  # 第二轮：收紧，保留数变少
+        second = run_video_extract(config, video_paths=[video])
+
+        output_dir = config.input_frames_dir / "clip"
+        on_disk = {p.name for p in output_dir.glob("*.png")}
+        manifest = read_json(config.workspace("extracted", "keyframes", "clip.json"))
+        listed = {Path(item["extracted_path"]).name for item in manifest["keyframes"]}
+        self.assertEqual(second["total_kept_frames"], len(listed))
+        self.assertEqual(on_disk, listed)  # 无陈旧帧残留
+
+
 if __name__ == "__main__":
     unittest.main()

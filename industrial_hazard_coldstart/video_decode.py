@@ -87,6 +87,18 @@ def _decode(payload: bytes | str | None) -> str:
     return payload.decode("utf-8", errors="replace")
 
 
+def _signed_returncode(code: int) -> int:
+    """把子进程退出码还原为**有符号**整数。
+
+    Windows 上被信号终止的进程退出码是 32 位无符号（如 ``-22`` 显示为
+    ``4294967274``、``-9`` 显示为 ``3199971767``），直接拼进错误信息会**难以排障**。
+    这里把 ``> 0x7FFFFFFF`` 的值按二补数还原回负值，其余原样返回。
+    """
+    if code > 0x7FFFFFFF:
+        return code - 0x100000000
+    return code
+
+
 def _resolve_executable(binary: str) -> str | None:
     """按 ``PATH`` 查找，再回退为显式路径；找不到返回 ``None``。"""
     if not binary:
@@ -168,7 +180,16 @@ def probe_video(path: Path | str, ffmpeg_binary: str) -> dict[str, Any]:
     Raises:
         FileNotFoundError: 文件不存在。
         FfmpegMissingError: ffprobe / ffmpeg 不可用。
-        ValueError: 文件无法解码 / 不含视频流（附 ffprobe 返回码与 stderr）。
+        ValueError: 文件无法解码 / 不含视频流 / **无可解码的视频时长**
+            （图片冒充视频、损坏文件；附 ffprobe 返回码与 stderr）。
+
+    Note:
+        **有效性判定以 ``duration_s`` 为主判据**：正常的视频文件一定有
+        ``duration > 0``；而一张 PNG 改名成 ``.mp4`` 时，ffprobe 会把它当作
+        ``png_pipe`` 视频流「探测成功」，但**时长缺失（``duration = 0``）**——
+        若放行，``inventory`` 会登记出 ``fps=25、count=0`` 的**假视频**。
+        故 ``duration_s <= 0`` 一律判为「非可解码视频」并抛 :class:`ValueError`。
+        ``nb_frames`` 仅作辅证（容器未报帧数的合法视频仍以时长为准，不被误伤）。
     """
     video = Path(path)
     if not video.exists():
@@ -194,7 +215,8 @@ def probe_video(path: Path | str, ffmpeg_binary: str) -> dict[str, Any]:
     stderr_text = _decode(completed.stderr).strip()
     if completed.returncode != 0:
         raise ValueError(
-            f"无法解码媒体文件（ffprobe 返回码 {completed.returncode}）：{video}\n"
+            f"无法解码媒体文件（ffprobe 返回码 {_signed_returncode(completed.returncode)}）："
+            f"{video}\n"
             f"ffprobe 输出：{stderr_text or '(空)'}"
         )
 
@@ -217,6 +239,17 @@ def probe_video(path: Path | str, ffmpeg_binary: str) -> dict[str, Any]:
     if nb_frames <= 0 and duration_s > 0 and fps > 0:
         nb_frames = int(round(duration_s * fps))
 
+    codec = str(video_stream.get("codec_name") or "")
+    format_name = str(fmt.get("format_name") or "")
+    if duration_s <= 0:
+        # 图片冒充视频 / 损坏文件：容器无有效时长 → 明确拒绝（绝不登记为假视频）。
+        raise ValueError(
+            f"文件没有可解码的视频时长（duration_s={duration_s}）：{video}\n"
+            "该文件可能是图片、音频或已损坏，而非可解码的视频。\n"
+            f"（codec={codec or '(无)'}，format={format_name or '(无)'}，"
+            f"nb_frames={nb_frames}）"
+        )
+
     return {
         "path": str(video),
         "duration_s": duration_s,
@@ -224,8 +257,8 @@ def probe_video(path: Path | str, ffmpeg_binary: str) -> dict[str, Any]:
         "height": int(_first_float(video_stream.get("height"))),
         "fps": fps,
         "nb_frames": nb_frames,
-        "codec": str(video_stream.get("codec_name") or ""),
-        "format_name": str(fmt.get("format_name") or ""),
+        "codec": codec,
+        "format_name": format_name,
         "size_bytes": int(_first_float(fmt.get("size"))),
     }
 
@@ -335,7 +368,8 @@ def sample_frames(
     stderr_text = _decode(completed.stderr).strip()
     if completed.returncode != 0:
         raise RuntimeError(
-            f"ffmpeg 抽帧失败（返回码 {completed.returncode}）：{video_path}\n"
+            f"ffmpeg 抽帧失败（返回码 {_signed_returncode(completed.returncode)}）："
+            f"{video_path}\n"
             f"命令：{' '.join(command)}\n"
             f"ffmpeg 输出：{stderr_text or '(空)'}"
         )
@@ -427,7 +461,16 @@ def select_keyframes(
 
     - ``enable``：关闭时直接保留全部帧（不做任何筛选）；
     - ``phash_size``：aHash 的降采样网格尺寸（构造 ``ImageStats``）；
-    - ``dedup_hamming_threshold``：与**上一个保留帧**的 aHash 汉明距离 ≤ 阈值 → 判重丢弃；
+    - ``dedup_hamming_threshold``：与**上一个保留帧**的 aHash 汉明距离 ≤ 阈值 → 判重丢弃。
+      判定式为「汉明距离 ≤ 阈值」，据此三种取值语义如下：
+
+      * ``> 0``：距离 ≤ 阈值的近似帧判重（常规去重）；
+      * ``= 0``：**仅「完全相同的 aHash」判重**（相同帧距离 = 0，``0 <= 0`` 成立 → 仍去重）；
+      * ``< 0``：**完全关闭去重**（距离恒 ≥ 0，``≥ 0`` 不可能 ≤ 负数 → 永不判重）。
+
+      ⚠️ 澄清口径：``= 0`` **不是**「关闭去重」，真正关闭需要 ``< 0``。相同帧本就应被去重，
+      故保持此行为（仅澄清文档，不改实现）。
+
     - ``motion_min_ratio`` + ``pixel_delta_threshold``：与**相邻帧**的运动比低于阈值 → 判静丢弃；
     - ``scene_change_threshold``：相邻帧直方图差 ≥ 阈值 → 场景切换，**强制保留**；
     - ``min_gap_seconds``：与上一个保留帧的时间间隔不足 → 丢弃（场景切换 / 强制保留可越过）；
@@ -554,6 +597,81 @@ def discover_videos(
     )
 
 
+def _extract_one_video(
+    config: ProjectConfig,
+    video: Path,
+    stats: ImageStats,
+) -> dict[str, Any]:
+    """处理**单个**视频：探测 → 抽帧 → 筛选 → 落盘到 ``input_frames_dir``。
+
+    该函数对单个视频是 **fail-loud** 的（失败即抛异常）；批量容错由
+    :func:`run_video_extract` 负责（记录失败视频并继续处理下一个）。
+
+    **幂等性（关键）**：写关键帧前会**清空该 source 子目录内上一轮遗留的
+    ``frame_*``**（与 :func:`sample_frames` 的清理口径一致）。否则收紧阈值重跑时，
+    上一轮的关键帧会残留在 ``input_frames_dir/<source_id>/``，与
+    ``keyframes/<source_id>.json`` 清单**不一致**；而下游 ``run_extraction`` 用
+    ``io_utils.iter_image_files()`` **递归读整个目录**，会把陈旧帧一并送检 →
+    VLM 调用量虚增、标注对象与清单不符。**只清该 source 自己的子目录**，绝不误删其他 source。
+
+    Returns:
+        该视频的摘要字典（含 ``sampled_frames`` / ``kept_frames`` / ``output_dir``）。
+    """
+    video_cfg = config.video
+    source_id = video.stem
+    probe = probe_video(video, video_cfg.ffmpeg_binary)
+    frames_dir = config.workspace("extracted", "video_frames", source_id)
+    sampled = sample_frames(
+        video,
+        frames_dir,
+        video_cfg.sample_fps,
+        video_cfg.ffmpeg_binary,
+        scale_width=video_cfg.scale_width,
+        analysis_width=video_cfg.analysis_width,
+    )
+    kept = select_keyframes(sampled, config.keyframe, stats)
+
+    output_dir = config.input_frames_dir / source_id
+    ensure_dir(output_dir)
+    # 清理该 source 子目录中上一轮遗留的关键帧，避免陈旧帧残留（见函数 docstring）。
+    for stale in output_dir.glob("frame_*"):
+        if stale.is_file():
+            stale.unlink()
+
+    kept_records: list[KeyframeRecord] = []
+    for record in kept:
+        source_frame = Path(record.extracted_path)
+        destination = output_dir / source_frame.name
+        shutil.copy2(source_frame, destination)
+        record.source_id = source_id
+        record.extracted_path = str(destination)
+        kept_records.append(record)
+
+    write_json(
+        config.workspace("extracted", "keyframes", f"{source_id}.json"),
+        {
+            "source_id": source_id,
+            "video": str(video),
+            "probe": probe,
+            "sampled_frames": len(sampled),
+            "kept_frames": len(kept_records),
+            "keyframes": [item.to_dict() for item in kept_records],
+        },
+    )
+
+    return {
+        "source_id": source_id,
+        "video": str(video),
+        "duration_s": probe["duration_s"],
+        "width": probe["width"],
+        "height": probe["height"],
+        "fps": probe["fps"],
+        "sampled_frames": len(sampled),
+        "kept_frames": len(kept_records),
+        "output_dir": str(output_dir),
+    }
+
+
 def run_video_extract(
     config: ProjectConfig,
     video_paths: list[Path] | None = None,
@@ -561,20 +679,29 @@ def run_video_extract(
     """执行「视频解码 + 关键帧筛选」，把保留的关键帧写入 ``input_frames_dir``。
 
     产出：
-    - ``config.input_frames_dir/<source_id>/*.png`` —— 保留的关键帧；
+    - ``config.input_frames_dir/<source_id>/*.png`` —— 保留的关键帧（**重跑前先清空**）；
     - ``workspace/extracted/video_frames/<source_id>/`` —— 全部抽样帧（含分析 PGM）；
     - ``workspace/extracted/keyframes/<source_id>.json`` —— 每段视频的关键帧清单；
     - ``workspace/status/extract_video.json`` —— 阶段摘要。
+
+    **批量容错（关键，但绝不静默）**：单个视频失败（不可解码 / 抽不出帧 / 探测失败）时，
+    **记录该视频与失败原因后继续处理下一个**，避免「一个 0.1 秒的坏视频拖垮整批」。
+    失败信息通过摘要显式暴露：
+    - ``failed_videos``：``[{source_id, video, error_type, reason}, ...]``；
+    - ``has_failures``：是否有失败（供调用方 / CLI 判定退出码）。
+
+    ⚠️ **容错 ≠ 静默**：「跳过并记录」与「悄悄跳过」的区别，就是有没有让调用方看见——
+    故本函数**永远**在摘要里回报失败清单，绝不隐藏。
 
     Args:
         config: 项目配置（消费 ``video`` 与 ``keyframe`` 两段全部字段）。
         video_paths: 显式视频列表；缺省按 :func:`discover_videos` 推导。
 
     Returns:
-        阶段摘要字典。
+        阶段摘要字典（含 ``failed_videos`` / ``has_failures``）。
 
     Raises:
-        ValueError: ``decode_backend`` 非 ffmpeg、或未找到任何视频。
+        ValueError: ``decode_backend`` 非 ffmpeg、或未找到任何视频（**硬错误**）。
         FfmpegMissingError: ffmpeg / ffprobe 不可用（明确降级，不静默）。
     """
     video_cfg = config.video
@@ -598,61 +725,29 @@ def run_video_extract(
     stats = ImageStats(config.keyframe.phash_size)
 
     source_summaries: list[dict[str, Any]] = []
+    failed_videos: list[dict[str, Any]] = []
     total_sampled = 0
     total_kept = 0
 
     for video in videos:
-        source_id = video.stem
-        probe = probe_video(video, video_cfg.ffmpeg_binary)
-        frames_dir = config.workspace("extracted", "video_frames", source_id)
-        sampled = sample_frames(
-            video,
-            frames_dir,
-            video_cfg.sample_fps,
-            video_cfg.ffmpeg_binary,
-            scale_width=video_cfg.scale_width,
-            analysis_width=video_cfg.analysis_width,
-        )
-        kept = select_keyframes(sampled, config.keyframe, stats)
-
-        output_dir = config.input_frames_dir / source_id
-        ensure_dir(output_dir)
-        kept_records: list[KeyframeRecord] = []
-        for record in kept:
-            source_frame = Path(record.extracted_path)
-            destination = output_dir / source_frame.name
-            shutil.copy2(source_frame, destination)
-            record.source_id = source_id
-            record.extracted_path = str(destination)
-            kept_records.append(record)
-
-        write_json(
-            config.workspace("extracted", "keyframes", f"{source_id}.json"),
-            {
-                "source_id": source_id,
-                "video": str(video),
-                "probe": probe,
-                "sampled_frames": len(sampled),
-                "kept_frames": len(kept_records),
-                "keyframes": [item.to_dict() for item in kept_records],
-            },
-        )
-
-        total_sampled += len(sampled)
-        total_kept += len(kept_records)
-        source_summaries.append(
-            {
-                "source_id": source_id,
-                "video": str(video),
-                "duration_s": probe["duration_s"],
-                "width": probe["width"],
-                "height": probe["height"],
-                "fps": probe["fps"],
-                "sampled_frames": len(sampled),
-                "kept_frames": len(kept_records),
-                "output_dir": str(output_dir),
-            }
-        )
+        try:
+            source_summary = _extract_one_video(config, video, stats)
+        except FfmpegMissingError:
+            # ffmpeg 在批量中途消失 → 环境级故障，不可静默跳过，直接上抛。
+            raise
+        except Exception as error:  # noqa: BLE001 - 单视频失败 → 记录并继续，绝不静默
+            failed_videos.append(
+                {
+                    "source_id": video.stem,
+                    "video": str(video),
+                    "error_type": type(error).__name__,
+                    "reason": str(error),
+                }
+            )
+            continue
+        total_sampled += source_summary["sampled_frames"]
+        total_kept += source_summary["kept_frames"]
+        source_summaries.append(source_summary)
 
     summary: dict[str, Any] = {
         "stage": "extract-video",
@@ -660,8 +755,11 @@ def run_video_extract(
         "sample_fps": video_cfg.sample_fps,
         "videos": source_summaries,
         "total_videos": len(videos),
+        "succeeded_videos": len(source_summaries),
         "total_sampled_frames": total_sampled,
         "total_kept_frames": total_kept,
+        "failed_videos": failed_videos,
+        "has_failures": bool(failed_videos),
     }
     write_json(config.workspace("status", "extract_video.json"), summary)
     return summary

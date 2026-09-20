@@ -78,7 +78,12 @@ def run_cycle(
         if auto_extract_video and _needs_video_extract(config, video_paths):
             chained = run_video_extract(config, video_paths=video_paths)
         summary = run_extraction(config)
-        return {"stage": "extract", "video_extract": chained, **summary}
+        result: dict[str, Any] = {"stage": "extract", "video_extract": chained, **summary}
+        # 把内嵌 video_extract 的部分失败上浮到顶层，供调用方 / CLI 判定退出码。
+        if isinstance(chained, dict) and chained.get("has_failures"):
+            result["has_failures"] = True
+            result["failed_videos"] = list(chained.get("failed_videos") or [])
+        return result
 
     raise ValueError(
         f"未知阶段：{stage!r}（本批支持：{', '.join(SUPPORTED_STAGES)}）"

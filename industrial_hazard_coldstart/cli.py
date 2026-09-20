@@ -140,6 +140,40 @@ def _stage_error_message(command: str, error: Exception) -> str:
     )
 
 
+def _payload_failures(payload: Any) -> list[dict[str, Any]]:
+    """从阶段摘要中提取「部分失败」清单（含 ``extract`` 内嵌的 ``video_extract``）。
+
+    容错（跳过并记录）不等于静默：只要摘要带 ``has_failures``，本函数就把它暴露给
+    CLI，由 CLI 以非 0 退出码让调用方看见。
+    """
+    failures: list[dict[str, Any]] = []
+    if not isinstance(payload, dict):
+        return failures
+    if payload.get("has_failures"):
+        failures.extend(payload.get("failed_videos") or [])
+    nested = payload.get("video_extract")
+    if isinstance(nested, dict) and nested.get("has_failures"):
+        failures.extend(nested.get("failed_videos") or [])
+    return failures
+
+
+def _partial_failure_message(command: str, failures: list[dict[str, Any]]) -> str:
+    """把「部分视频失败」转成可读的中文提示（不打印栈）。"""
+    lines = [
+        f"警告：阶段 `{command}` 完成，但有 {len(failures)} 个视频失败（已跳过并记录）："
+    ]
+    for item in failures:
+        lines.append(
+            f"  - {item.get('source_id', '?')}"
+            f"（{item.get('error_type', 'Error')}）：{item.get('reason', '')}"
+        )
+    lines.append(
+        f"（退出码 {EXIT_STAGE_FAILED} = 阶段部分失败；失败清单亦见阶段摘要 "
+        f"的 failed_videos 字段。）"
+    )
+    return "\n".join(lines)
+
+
 def _config_error_message(config_path: str, error: Exception) -> str:
     """把配置读取失败转成可读的中文错误（不打印栈）。"""
     return (
@@ -189,6 +223,11 @@ def main(argv: list[str] | None = None) -> int:
             print(_stage_error_message(args.command, error), file=sys.stderr)
             return EXIT_STAGE_FAILED
         _print_payload(payload)
+        # 部分视频失败（容错跳过）→ 非 0 退出码，让调用方看见，绝不静默。
+        failures = _payload_failures(payload)
+        if failures:
+            print(_partial_failure_message(args.command, failures), file=sys.stderr)
+            return EXIT_STAGE_FAILED
         return EXIT_READY
 
     if args.command in _PENDING_COMMANDS:
