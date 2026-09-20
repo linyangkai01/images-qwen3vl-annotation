@@ -43,6 +43,25 @@ own/hoist_project/
 
 4. **VLM 调用从 `lab-server` 发起**：本机到端点不可达（实测 TCP 超时），
    端点调用必须落在服务器侧。
+5. **原始素材目录约定（`media_root`）**：配置里没有「原始素材目录」字段，
+   编目（`inventory`）默认扫描 **`input_frames_dir` 同级的 `media/`**，
+   即 `own/hoist_project/input/media/`。之所以这样定：让「原始素材」与
+   「抽帧产物（`input/frames/`）」分离，互不污染，且不必改动配置结构。
+   如需指向别处（如挂载盘），用 `run_inventory(config, media_root=...)`
+   或 CLI 的 `--config` 指向的工程里调整；**切勿把真实素材复制进仓库**。
+
+## 抽帧产物：PNG 是交付物，PGM 是中间产物
+
+`extract-video` 阶段对每段视频按 `video.sample_fps` 抽帧，每帧产出两个文件：
+
+- `frame_<i>_<ts>.png` —— **关键帧交付物**（按 `video.scale_width` 缩放），
+  写入 `input/frames/<source_id>/`，供母项目 `run_extraction` 消费；
+- `frame_<i>_<ts>.pgm` —— **灰度分析中间产物**（按 `video.analysis_width` 缩放），
+  留在 `workspace/extracted/video_frames/<source_id>/`。
+
+> 母项目 `imageio` 只能解码 Netpbm，故去重分析依赖 PGM；PNG 仅供交付/可视化。
+> **PGM 可安全删除**（保留它是为了调整去重阈值时不必重新解码视频）。
+> 请勿把 PGM 当作必须交付的产物。
 
 ## 运行顺序
 
@@ -52,9 +71,14 @@ pwsh -File scripts/run_hoist_cycle.ps1
 ```
 
 ```bash
-# lab-server（Linux）全量：完整链路（当前 T02–T05 未实现，会明确报「尚未实现」）
+# lab-server（Linux）全量：完整链路（当前 T03–T05 未实现，会明确报「尚未实现」）
 bash scripts/run_hoist_cycle.sh
 ```
 
 阶段顺序：`inventory → extract-video → extract → annotate → prioritize →
 curate → freeze-holdout → train → evaluate`（`doctor` 可随时单独跑）。
+
+> 已实现（可跑）：`doctor`、`inventory`、`extract-video`、`extract`（T01–T02）。
+> 仍未实现：`annotate / prioritize / curate / freeze-holdout / train / evaluate`
+> —— CLI 会明确报「尚未实现」并返回退出码 `2`，**绝不静默成功**。
+> 已实现阶段的执行失败（如 ffmpeg 缺失）返回退出码 `4`。

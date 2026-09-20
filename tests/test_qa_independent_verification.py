@@ -37,7 +37,12 @@ from traffic_cv_closed_loop.config import (
 )
 
 from industrial_hazard_coldstart import models, taxonomy
-from industrial_hazard_coldstart.cli import main
+from industrial_hazard_coldstart.cli import (
+    DATA_STAGE_COMMANDS,
+    IMPLEMENTED_COMMANDS,
+    PENDING_COMMANDS,
+    main,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 HOIST_CONFIG = ROOT / "own" / "hoist_project" / "config" / "project.hoist.json"
@@ -362,10 +367,24 @@ class RoundTripTest(unittest.TestCase):
 # 5. CLI 与 doctor 实际行为
 # --------------------------------------------------------------------------- #
 class CliAndDoctorTest(unittest.TestCase):
-    PENDING = (
-        "inventory", "extract-video", "extract", "annotate", "prioritize",
-        "curate", "freeze-holdout", "train", "evaluate",
-    )
+    # ⚠️ 断言对象是「**仍未实现**」的子命令集合，**引用 cli 常量**而非硬编码子命令名。
+    #
+    # 约定：每实现一个阶段，就把它从 ``cli._PENDING_COMMANDS`` 移入
+    # ``cli.IMPLEMENTED_COMMANDS``——**只改一处**。
+    # 若本用例失败，先确认是不是有阶段刚被实现（此时应更新 cli 常量，而不是改断言）。
+    PENDING = tuple(sorted(PENDING_COMMANDS))
+
+    def test_implemented_and_pending_are_disjoint_and_cover_all(self) -> None:
+        # 两个集合必须互斥，且并集覆盖全部已声明的子命令（doctor 已实现）。
+        implemented = set(IMPLEMENTED_COMMANDS)
+        pending = set(PENDING_COMMANDS)
+        self.assertTrue(implemented.isdisjoint(pending))
+        self.assertIn("doctor", implemented)
+        # T02 三个子命令已转正：不应再出现在「未实现」集合里。
+        for command in ("inventory", "extract-video", "extract"):
+            self.assertIn(command, implemented)
+            self.assertNotIn(command, pending)
+        self.assertEqual(set(DATA_STAGE_COMMANDS), {"inventory", "extract-video", "extract"})
 
     def test_help_exit_code_zero(self) -> None:
         with self.assertRaises(SystemExit) as ctx, contextlib.redirect_stdout(io.StringIO()):
