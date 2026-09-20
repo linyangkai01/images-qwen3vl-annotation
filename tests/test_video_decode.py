@@ -32,10 +32,16 @@ from traffic_cv_closed_loop.config import KeyframeConfig, ProjectConfig
 from traffic_cv_closed_loop.imageio import ImageStats, encode_png, load_image
 from traffic_cv_closed_loop.io_utils import read_json, read_jsonl
 
-from industrial_hazard_coldstart.inventory import run_inventory, scan_media
+from industrial_hazard_coldstart.inventory import (
+    is_ignorable_media_path,
+    run_inventory,
+    scan_media,
+    scan_media_detailed,
+)
 from industrial_hazard_coldstart.orchestrator import run_cycle
 from industrial_hazard_coldstart.video_decode import (
     FfmpegMissingError,
+    discover_videos,
     probe_video,
     run_video_extract,
     sample_frames,
@@ -818,6 +824,131 @@ class IdempotencyTest(unittest.TestCase):
         listed = {Path(item["extracted_path"]).name for item in manifest["keyframes"]}
         self.assertEqual(second["total_kept_frames"], len(listed))
         self.assertEqual(on_disk, listed)  # 无陈旧帧残留
+
+
+# --------------------------------------------------------------------------- #
+# 7. R1 修复：macOS `._` / `__MACOSX` 垃圾文件不得被登记为素材
+# --------------------------------------------------------------------------- #
+class InventoryInputHygieneTest(unittest.TestCase):
+    """`._*` AppleDouble / `__MACOSX` / 隐藏文件与目录必须被跳过（且不误伤正常文件）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_scan_media_skips_apple_double_and_macosx(self) -> None:
+        media = self.tmp / "media" / "宿州照片"
+        media.mkdir(parents=True)
+        (media / "真实照片.png").write_bytes(encode_png(8, 8, bytes([9, 9, 9] * 64)))
+        # 同级 AppleDouble 垃圾（`._` 前缀）。
+        (media / "._真实照片.png").write_bytes(b"junk")
+        (media / "._001产品吊装.jpg").write_bytes(b"junk")
+        (media / ".DS_Store").write_bytes(b"junk")
+        # __MACOSX 目录（macOS 压缩生成）。
+        mac = media / "__MACOSX" / "宿州照片"
+        mac.mkdir(parents=True)
+        (mac / "._001产品吊装未使用平衡梁.jpg").write_bytes(b"junk")
+        # 隐藏目录。
+        hidden = media / ".hidden"
+        hidden.mkdir()
+        (hidden / "x.png").write_bytes(encode_png(4, 4, bytes([1, 1, 1] * 16)))
+
+        assets = scan_media(self.tmp / "media", "hoist", ffmpeg_binary=None)
+
+        self.assertEqual(len(assets), 1, [a.source_id for a in assets])
+        self.assertEqual(assets[0].source_id, "宿州照片__真实照片")
+        self.assertEqual(assets[0].media_type, "image")
+
+    def test_scan_media_keeps_normal_files(self) -> None:
+        media = self.tmp / "media" / "中文目录"
+        media.mkdir(parents=True)
+        (media / "照片一.png").write_bytes(encode_png(12, 7, bytes([1, 2, 3] * 84)))
+        _write_pgm(media / "照片二.pgm", 5, 9, lambda x, y: x + y)
+        # 正常视频（ffmpeg_binary=None → 只登记路径，不读容器头）。
+        (media / "作业视频.mp4").write_bytes(b"\x00" * 16)
+
+        assets = scan_media(self.tmp / "media", "hoist", ffmpeg_binary=None)
+
+        self.assertEqual(len(assets), 3, [a.source_id for a in assets])
+        types = sorted(a.media_type for a in assets)
+        self.assertEqual(types, ["image", "image", "video"])
+
+    def test_name_with_inner_dots_is_not_false_positive(self) -> None:
+        # 文件名含 "._" 但**不以** "." 开头 → 不是隐藏文件，必须照常登记。
+        media = self.tmp / "media"
+        media.mkdir(parents=True)
+        (media / "a._b.png").write_bytes(encode_png(4, 4, bytes([7] * 48)))
+
+        assets = scan_media(self.tmp / "media", "hoist", ffmpeg_binary=None)
+
+        self.assertEqual(len(assets), 1)
+        self.assertEqual(assets[0].source_id, "a._b")
+
+    def test_scan_media_detailed_records_skipped(self) -> None:
+        media = self.tmp / "media"
+        media.mkdir(parents=True)
+        (media / "keep.png").write_bytes(encode_png(6, 6, bytes([3] * 108)))
+        (media / "._skip1.png").write_bytes(b"junk")
+        (media / "._skip2.mp4").write_bytes(b"junk")
+        mac = media / "__MACOSX"
+        mac.mkdir()
+        (mac / "._skip3.jpg").write_bytes(b"junk")
+
+        assets, skipped = scan_media_detailed(self.tmp / "media", "hoist", ffmpeg_binary=None)
+
+        self.assertEqual(len(assets), 1)
+        self.assertEqual(skipped["count"], 3)
+        self.assertEqual(len(skipped["samples"]), 3)
+        # 样例是相对路径（可读、便于定位）。
+        self.assertTrue(all("._" in sample or "__MACOSX" in sample for sample in skipped["samples"]))
+
+    def test_run_inventory_writes_skipped_stats(self) -> None:
+        media = self.tmp / "input" / "media" / "宿州照片"
+        media.mkdir(parents=True)
+        (media / "a.png").write_bytes(encode_png(10, 10, bytes([9] * 300)))
+        (media / "._a.png").write_bytes(b"junk")
+        mac = media / "__MACOSX"
+        mac.mkdir()
+        (mac / "._b.jpg").write_bytes(b"junk")
+        config = _make_config(self.tmp, ffmpeg_binary="coldstart-no-such-ffmpeg")
+
+        manifest = run_inventory(config)
+
+        self.assertEqual(manifest["counts"]["image"], 1)
+        self.assertEqual(manifest["counts"]["total"], 1)
+        self.assertEqual(manifest["counts"]["skipped"], 2)
+        self.assertEqual(manifest["skipped"]["count"], 2)
+        self.assertTrue(manifest["skipped"]["samples"])
+        # manifest.json 落盘后同样可见（绝不静默）。
+        on_disk = read_json(config.workspace("inventory", "manifest.json"))
+        self.assertEqual(on_disk["counts"]["skipped"], 2)
+        self.assertEqual(on_disk["skipped"]["count"], 2)
+
+    def test_discover_videos_skips_metadata(self) -> None:
+        media = self.tmp / "input" / "media"
+        media.mkdir(parents=True)
+        (media / "real.mp4").write_bytes(b"\x00" * 16)
+        (media / "._real.mp4").write_bytes(b"junk")
+        mac = media / "__MACOSX"
+        mac.mkdir()
+        (mac / "ghost.mp4").write_bytes(b"junk")
+        config = _make_config(self.tmp)
+
+        found = discover_videos(config)
+
+        self.assertEqual({path.name for path in found}, {"real.mp4"})
+
+    def test_is_ignorable_media_path_contract(self) -> None:
+        root = self.tmp / "media"
+        root.mkdir(parents=True)
+        self.assertTrue(is_ignorable_media_path(root / "._x.mp4", root))
+        self.assertTrue(is_ignorable_media_path(root / ".hidden" / "x.png", root))
+        self.assertTrue(is_ignorable_media_path(root / "__MACOSX" / "x.png", root))
+        self.assertFalse(is_ignorable_media_path(root / "中文名.jpg", root))
+        self.assertFalse(is_ignorable_media_path(root / "a._b.png", root))
 
 
 if __name__ == "__main__":

@@ -36,7 +36,11 @@ from traffic_cv_closed_loop.config import KeyframeConfig, ProjectConfig
 from traffic_cv_closed_loop.imageio import ImageStats, load_image
 from traffic_cv_closed_loop.io_utils import ensure_dir, read_json, stem_sidecar, write_json
 
-from industrial_hazard_coldstart.inventory import VIDEO_SUFFIXES, default_media_root
+from industrial_hazard_coldstart.inventory import (
+    VIDEO_SUFFIXES,
+    default_media_root,
+    is_ignorable_media_path,
+)
 from industrial_hazard_coldstart.models import KeyframeRecord
 
 __all__ = [
@@ -582,6 +586,9 @@ def discover_videos(
     """确定待处理的视频列表。
 
     优先级：显式 ``video_paths`` > ``config.video.video_path`` > 扫描默认媒体根。
+    扫描默认媒体根时**跳过**隐藏文件 / 隐藏目录 / macOS 元数据（``._*`` /
+    ``__MACOSX``）——见 :func:`inventory.is_ignorable_media_path`；显式传入的路径
+    视为调用方有意为之，不做跳过。
     """
     if video_paths:
         return [Path(item) for item in video_paths]
@@ -593,7 +600,10 @@ def discover_videos(
     return sorted(
         path
         for path in root.rglob("*")
-        if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES
+        if path.is_file()
+        and path.suffix.lower() in VIDEO_SUFFIXES
+        # 输入卫生：跳过隐藏文件 / 隐藏目录 / macOS 元数据（._* / __MACOSX）。
+        and not is_ignorable_media_path(path, root)
     )
 
 

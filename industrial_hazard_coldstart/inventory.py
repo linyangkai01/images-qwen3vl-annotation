@@ -37,8 +37,12 @@ from industrial_hazard_coldstart.models import MediaAsset
 
 __all__ = [
     "VIDEO_SUFFIXES",
+    "HIDDEN_METADATA_DIRNAME",
+    "MAX_SKIPPED_SAMPLES",
     "default_media_root",
+    "is_ignorable_media_path",
     "scan_media",
+    "scan_media_detailed",
     "run_inventory",
 ]
 
@@ -62,8 +66,56 @@ VIDEO_SUFFIXES: frozenset[str] = frozenset(
     }
 )
 
+#: macOS 压缩 / 拷贝时生成的元数据目录名（内含 AppleDouble 等垃圾，**不是**用户素材）。
+HIDDEN_METADATA_DIRNAME: str = "__MACOSX"
+
+#: 跳过清单里最多记录多少条样例（避免 manifest 膨胀；数量仍为全量）。
+MAX_SKIPPED_SAMPLES: int = 20
+
 #: Netpbm 系列（母项目 ``imageio`` 可直接读，无需 ffprobe）。
 _NETPBM_SUFFIXES: frozenset[str] = frozenset({".pgm", ".ppm", ".pnm", ".pbm"})
+
+
+def is_ignorable_media_path(path: Path, root: Path | None = None) -> bool:
+    """判断某路径是否应被**跳过**（隐藏文件 / 隐藏目录 / macOS 元数据）。
+
+    macOS 用 ``ditto`` / Finder 压缩目录时会写入 AppleDouble 资源分叉（``._*``）
+    与 ``__MACOSX`` 目录；这些文件**不是**用户素材，若被登记会污染候选集，下游
+    抽帧 / 标注**必然全部失败**（需求 F1 的输入卫生）。
+
+    跳过判据（对相对 ``root`` 的**每一段**路径名逐段判断）：
+
+    - 任一段以 ``.`` 开头 → 隐藏文件 / 隐藏目录（覆盖 ``._*`` / ``.DS_Store`` 等）；
+    - 任一段等于 ``__MACOSX`` → macOS 元数据目录。
+
+    该判据对**正常文件零误伤**：中文名、正常扩展名、非隐藏路径一律照常登记。
+
+    Args:
+        path: 待判断的路径。
+        root: 素材根目录；给定时按相对路径逐段判断，``None`` 时只看文件名。
+
+    Returns:
+        ``True`` 表示应跳过。
+    """
+    candidate = Path(path)
+    if root is not None:
+        try:
+            candidate = candidate.relative_to(Path(root))
+        except ValueError:
+            candidate = Path(path.name)
+    for part in candidate.parts:
+        if part.startswith(".") or part == HIDDEN_METADATA_DIRNAME:
+            return True
+    return False
+
+
+def _skipped_relative(path: Path, root: Path) -> str:
+    """跳过样例的可读标识：优先相对路径（``/`` 分隔），否则退回文件名。"""
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.name
+
 
 
 def default_media_root(config: ProjectConfig) -> Path:
@@ -218,12 +270,59 @@ def _relative_source_id(path: Path, root: Path) -> str:
 # --------------------------------------------------------------------------- #
 # 扫描与编目
 # --------------------------------------------------------------------------- #
+def scan_media_detailed(
+    root: Path,
+    scene: str,
+    ffmpeg_binary: str | None = None,
+) -> tuple[list[MediaAsset], dict[str, Any]]:
+    """递归扫描 ``root``，返回 ``(素材清单, 跳过统计)``。
+
+    与 :func:`scan_media` 同口径，但额外返回**被跳过**的隐藏 / macOS 元数据统计，
+    使调用方**看得见**少登记了多少（本项目「绝不静默」的既定规矩）。
+
+    Args:
+        root: 媒体素材根目录（可含中文）。
+        scene: 场景标签。
+        ffmpeg_binary: ffmpeg 可执行路径；``None`` 时视频只登记路径、不读容器头。
+
+    Returns:
+        ``(assets, skipped)``：``assets`` 按路径排序；``skipped`` 形如
+        ``{"count": int, "samples": [str, ...]}``（``samples`` 至多
+        :data:`MAX_SKIPPED_SAMPLES` 条，``count`` 为全量）。
+    """
+    root = Path(root)
+    if not root.exists():
+        return [], {"count": 0, "samples": []}
+
+    assets: list[MediaAsset] = []
+    skipped_count = 0
+    skipped_samples: list[str] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        # 输入卫生：跳过隐藏文件 / 隐藏目录 / macOS 元数据（._* / __MACOSX）。
+        if is_ignorable_media_path(path, root):
+            skipped_count += 1
+            if len(skipped_samples) < MAX_SKIPPED_SAMPLES:
+                skipped_samples.append(_skipped_relative(path, root))
+            continue
+        suffix = path.suffix.lower()
+        if suffix in VIDEO_SUFFIXES:
+            assets.append(_video_asset(path, scene, ffmpeg_binary))
+        elif suffix in SUPPORTED_IMAGE_SUFFIXES:
+            assets.append(_image_asset(path, root, scene))
+    return assets, {"count": skipped_count, "samples": skipped_samples}
+
+
 def scan_media(
     root: Path,
     scene: str,
     ffmpeg_binary: str | None = None,
 ) -> list[MediaAsset]:
     """递归扫描 ``root``，把视频与照片登记为 :class:`MediaAsset` 列表。
+
+    跳过隐藏文件 / 隐藏目录 / macOS 元数据（``._*`` / ``__MACOSX``）——见
+    :func:`is_ignorable_media_path`。需要跳过统计时用 :func:`scan_media_detailed`。
 
     Args:
         root: 媒体素材根目录（可含中文）。
@@ -233,19 +332,7 @@ def scan_media(
     Returns:
         按路径排序的素材清单；``root`` 不存在时返回空列表（不抛异常）。
     """
-    root = Path(root)
-    if not root.exists():
-        return []
-
-    assets: list[MediaAsset] = []
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        suffix = path.suffix.lower()
-        if suffix in VIDEO_SUFFIXES:
-            assets.append(_video_asset(path, scene, ffmpeg_binary))
-        elif suffix in SUPPORTED_IMAGE_SUFFIXES:
-            assets.append(_image_asset(path, root, scene))
+    assets, _skipped = scan_media_detailed(root, scene, ffmpeg_binary)
     return assets
 
 
@@ -262,16 +349,18 @@ def run_inventory(
         scene: 场景标签；缺省用 ``config.scene``。
 
     Returns:
-        manifest 字典（含 ``assets`` 与 ``counts``）。
+        manifest 字典（含 ``assets`` / ``counts`` / ``skipped``）。
     """
     resolved_scene = scene or config.scene
     root = Path(media_root) if media_root is not None else default_media_root(config)
-    assets = scan_media(root, resolved_scene, config.video.ffmpeg_binary)
+    assets, skipped = scan_media_detailed(root, resolved_scene, config.video.ffmpeg_binary)
 
     counts = {
         "total": len(assets),
         "video": sum(1 for item in assets if item.media_type == "video"),
         "image": sum(1 for item in assets if item.media_type == "image"),
+        # 被跳过的隐藏 / macOS 元数据（不计入 total，但必须可见）。
+        "skipped": skipped["count"],
     }
     manifest: dict[str, Any] = {
         "scene": resolved_scene,
@@ -279,6 +368,7 @@ def run_inventory(
         "media_root_exists": root.exists(),
         "assets": [item.to_dict() for item in assets],
         "counts": counts,
+        "skipped": skipped,
     }
 
     manifest_path = config.workspace("inventory", "manifest.json")
@@ -290,6 +380,7 @@ def run_inventory(
         "manifest_path": str(manifest_path),
         "media_root": str(root),
         "counts": counts,
+        "skipped": skipped,
     }
     write_json(config.workspace("status", "inventory.json"), status)
     return manifest
