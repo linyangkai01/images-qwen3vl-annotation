@@ -34,6 +34,7 @@ from traffic_cv_closed_loop.dataset_media import (
 from traffic_cv_closed_loop.io_utils import (
     copy_file,
     ensure_dir,
+    read_json,
     read_jsonl,
     write_json,
     write_text,
@@ -51,15 +52,25 @@ from industrial_hazard_coldstart.holdout import (
 __all__ = [
     "DEFAULT_QUALITY_THRESHOLDS",
     "DEFAULT_HOLDOUT_RATIO",
+    "QUALITY_THRESHOLD_KEYS",
     "frame_quality",
     "keep_record",
     "split_counts",
     "build_dataset_yaml",
+    "load_config_quality_thresholds",
+    "resolve_quality_thresholds",
     "curate_records",
     "build_dataset",
 ]
 
 #: 质量过滤默认阈值（与 ``scripts/curate_video_batch.py`` 的命令行默认值一致）。
+#:
+#: ⚠️ **该默认值假设「VLM 只纠偏、不新增」**（``max_added=0``）。真实场景下通用 YOLO
+#: 初检漏检严重（实测：YOLO 55 个 vs VLM 216 个目标，36/37 帧都有 VLM 新增），若沿用
+#: 该默认值会**把全部帧剔除**（``所有帧都被质量过滤剔除``）。真实素材跑批**必须放宽**
+#: ——通过配置文件的 ``pipeline.quality_thresholds`` 覆盖，例如
+#: ``{"max_added": 20, "max_adjusted": 10}``（见 :func:`load_config_quality_thresholds`）。
+#: **本默认值刻意不改**：它与母项目脚本命令行默认值对齐，改了会破坏该对齐。
 DEFAULT_QUALITY_THRESHOLDS: dict[str, Any] = {
     "min_confidence": 0.25,
     "max_added": 0,
@@ -67,6 +78,12 @@ DEFAULT_QUALITY_THRESHOLDS: dict[str, Any] = {
     "max_adjusted": 2,
     "min_labels": 1,
 }
+
+#: 合法的质量阈值键集合（未知键一律 fail-loud）。
+QUALITY_THRESHOLD_KEYS: frozenset[str] = frozenset(DEFAULT_QUALITY_THRESHOLDS)
+
+#: 配置文件里承载质量阈值的路径：``pipeline.quality_thresholds``。
+_CONFIG_QUALITY_KEY: str = "quality_thresholds"
 
 #: 素材筛选脚本（不是包，故按文件路径加载）。
 _CURATION_SCRIPT: Path = (
@@ -175,25 +192,79 @@ def _is_within(child: Path, parent: Path) -> bool:
         return False
 
 
-def _quality_namespace(thresholds: dict[str, Any] | None) -> argparse.Namespace:
-    """把阈值字典规整成 ``keep_record`` 需要的 ``argparse.Namespace``。
+def load_config_quality_thresholds(config: ProjectConfig) -> dict[str, Any]:
+    """从**配置文件**读取 ``pipeline.quality_thresholds``（可选）。
 
-    - 键值为 ``None`` → 回落默认（明文约定）；
+    **为什么在这里读**：母项目 ``ProjectConfig`` 硬约束不得改动（不加字段），故本包
+    自行读取配置文件 JSON，取其 ``pipeline.quality_thresholds`` 子对象。这样真实素材
+    跑批可**只改配置文件**（无需 API 绕过、无需新增 CLI 开关）。
+
+    Args:
+        config: 项目配置（用其 ``config_path`` 定位配置文件）。
+
+    Returns:
+        配置里的质量阈值字典（缺省 / 非法 / 非 dict 时返回 ``{}``）；值保留原样，
+        ``None`` 表示「该键回落下一优先级」。
+    """
+    config_path = getattr(config, "config_path", None)
+    if not config_path:
+        return {}
+    payload = read_json(Path(config_path), default=None)
+    if not isinstance(payload, dict):
+        return {}
+    pipeline = payload.get("pipeline")
+    if not isinstance(pipeline, dict):
+        return {}
+    raw = pipeline.get(_CONFIG_QUALITY_KEY)
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): value for key, value in raw.items()}
+
+
+def resolve_quality_thresholds(
+    config: ProjectConfig,
+    thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """按优先级合并质量阈值：**显式参数 > 配置文件 > 默认值**。
+
+    Args:
+        config: 项目配置。
+        thresholds: 显式覆盖（函数参数）；``None`` 表示不覆盖。
+
+    Returns:
+        合并后的完整阈值字典。
+
+    Raises:
+        ValueError: 配置文件或显式参数里出现**未知键**（列出合法键）。
+    """
+    values = dict(DEFAULT_QUALITY_THRESHOLDS)
+    layers: list[dict[str, Any]] = [load_config_quality_thresholds(config)]
+    if thresholds:
+        layers.append(dict(thresholds))
+    for layer in layers:
+        unknown = sorted(key for key in layer if key not in QUALITY_THRESHOLD_KEYS)
+        if unknown:
+            raise ValueError(
+                f"未知的质量阈值键：{unknown}；合法键为 {sorted(QUALITY_THRESHOLD_KEYS)}。"
+            )
+        for key, value in layer.items():
+            if value is not None:
+                values[key] = value
+    return values
+
+
+def _quality_namespace(
+    config: ProjectConfig,
+    thresholds: dict[str, Any] | None,
+) -> argparse.Namespace:
+    """把阈值（显式 > 配置 > 默认）规整成 ``keep_record`` 需要的 ``argparse.Namespace``。
+
+    - 优先级见 :func:`resolve_quality_thresholds`；
     - **未知键 → 立刻 ``ValueError``**（列出合法键）。拼错的键（如 ``min_conf``
       漏了 ``idence``）若被静默丢弃，使用者以为收紧了过滤、实际没生效，属典型静默
       失败；本项目一律 fail-loud。
     """
-    values = dict(DEFAULT_QUALITY_THRESHOLDS)
-    if thresholds:
-        unknown = sorted(key for key in thresholds if key not in values)
-        if unknown:
-            raise ValueError(
-                f"未知的质量阈值键：{unknown}；合法键为 {sorted(values)}。"
-            )
-        for key, value in thresholds.items():
-            if value is not None:
-                values[key] = value
-    return argparse.Namespace(**values)
+    return argparse.Namespace(**resolve_quality_thresholds(config, thresholds))
 
 
 def _split_train_val(
@@ -296,7 +367,8 @@ def curate_records(
 
     Args:
         config: 项目配置。
-        quality_thresholds: 覆盖默认质量阈值（未知键 → ``ValueError``）。
+        quality_thresholds: 显式覆盖的质量阈值（**优先级最高**；未知键 → ``ValueError``）。
+            未给出的键按 **配置文件 ``pipeline.quality_thresholds`` > 默认值** 回落。
 
     Returns:
         ``(all_records, accepted, rejected, quality_rows)``。
@@ -313,7 +385,7 @@ def curate_records(
             f"未找到标注记录 {config.annotations_path}，请先运行 `annotate` 阶段。"
         )
 
-    args = _quality_namespace(quality_thresholds)
+    args = _quality_namespace(config, quality_thresholds)
     quality_rows: list[dict[str, Any]] = []
     accepted: list[AnnotationRecord] = []
     rejected: list[AnnotationRecord] = []

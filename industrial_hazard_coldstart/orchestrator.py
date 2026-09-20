@@ -70,7 +70,7 @@ from industrial_hazard_coldstart.holdout import (
     validate_holdout_ratio,
     verify_holdout,
 )
-from industrial_hazard_coldstart.inventory import run_inventory
+from industrial_hazard_coldstart.inventory import is_ignorable_media_path, run_inventory
 from industrial_hazard_coldstart.knowledge import (
     backfill_hazards,
     extract_model_hazards,
@@ -142,6 +142,36 @@ def _needs_video_extract(
     if iter_image_files(config.input_frames_dir):
         return False
     return bool(discover_videos(config, video_paths))
+
+
+def _count_sidecar_files(root: Path) -> int:
+    """统计 ``root`` 下的 sidecar 检测文件数（``*.detections.json``，跳过隐藏/元数据）。"""
+    if not root.exists():
+        return 0
+    return sum(
+        1
+        for path in root.rglob("*.detections.json")
+        if path.is_file() and not is_ignorable_media_path(path, root)
+    )
+
+
+def _extract_warnings(config: ProjectConfig) -> list[str]:
+    """``extract`` 阶段的可见告警（P2：sidecar 零命中不得静默）。
+
+    真实场景误配 ``yolo.detector=sidecar``（默认值面向 mock）时，若**一帧 sidecar 都
+    没读到**，全部帧会被判为空 → ``selected_candidates: 0`` 但退出码 0，调用方会误以为
+    「这批素材真的没目标」。故此处显式告警，使其**可见**（不报错——sidecar 模式本身合法）。
+    """
+    warnings: list[str] = []
+    if str(config.yolo_detector).lower() == "sidecar":
+        if _count_sidecar_files(config.input_frames_dir) == 0:
+            warnings.append(
+                "sidecar_zero_hit：检测器为 `sidecar`，但在 input_frames_dir 下**未找到任何 "
+                "`*.detections.json` sidecar 文件**，全部帧将因「无有效检测」被跳过。"
+                "若本意是用真实模型初检，请把 `yolo.detector` 改为 `ultralytics`；"
+                "若确实依赖 sidecar，请确认 sidecar 已随帧生成。"
+            )
+    return warnings
 
 
 # --------------------------------------------------------------------------- #
@@ -309,7 +339,25 @@ def run_annotate(config: ProjectConfig) -> dict[str, Any]:
 
     Returns:
         阶段摘要（含标注摘要与隐患回填统计）。
+
+    Raises:
+        ValueError: ``candidates.jsonl`` **缺失或为空**——上游 ``extract`` 未产出候选帧。
+            此时**必须 fail-loud**：否则标注会「退出码 0、报告成功」但产物全空，
+            流程显示绿灯而实际什么都没做（真实闭环暴露的 P1 静默缺陷）。
     """
+    # P1 静默护栏：候选帧清单缺失或为空都必须 fail-loud，绝不「空跑成功」。
+    if not config.candidates_path.exists():
+        raise ValueError(
+            f"未找到候选帧清单 {config.candidates_path}；"
+            "请先运行 `extract` 阶段产出 candidates.jsonl。"
+        )
+    candidates = read_jsonl(config.candidates_path)
+    if not candidates:
+        raise ValueError(
+            f"候选帧清单 {config.candidates_path} 为空；"
+            "上游 `extract` 未产出任何候选帧（属异常），`annotate` 拒绝静默空跑。"
+        )
+
     annotation_summary = run_annotation(config)
 
     kb = load_knowledge_base(config.kb_path)
@@ -769,6 +817,10 @@ def run_cycle(
             chained = run_video_extract(config, video_paths=video_paths)
         summary = run_extraction(config)
         result: dict[str, Any] = {"stage": "extract", "video_extract": chained, **summary}
+        # P2：sidecar 零命中等「静默风险」以 warnings 形式暴露（不报错，但必须可见）。
+        warnings = _extract_warnings(config)
+        if warnings:
+            result["warnings"] = warnings
         # 把内嵌 video_extract 的部分失败上浮到顶层，供调用方 / CLI 判定退出码。
         if isinstance(chained, dict) and chained.get("has_failures"):
             result["has_failures"] = True

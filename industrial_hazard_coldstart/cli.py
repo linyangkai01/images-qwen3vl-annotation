@@ -202,6 +202,27 @@ def _partial_failure_message(command: str, failures: list[dict[str, Any]]) -> st
     return "\n".join(lines)
 
 
+def _payload_warnings(payload: Any) -> list[str]:
+    """从阶段摘要中提取**可见告警**（``warnings`` 列表）。
+
+    告警是「合法但可能误配」的信号（如 sidecar 零命中），**不影响退出码**（仍为 0），
+    但必须打到 stderr，避免调用方以为「一切正常」。
+    """
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get("warnings")
+    if not isinstance(raw, list):
+        return []
+    return [str(item) for item in raw]
+
+
+def _warnings_message(command: str, warnings: list[str]) -> str:
+    """把阶段告警转成可读的中文提示（不打印栈，退出码不变）。"""
+    lines = [f"提示：阶段 `{command}` 完成，但有 {len(warnings)} 条告警（请复核）："]
+    lines.extend(f"  - {item}" for item in warnings)
+    return "\n".join(lines)
+
+
 def _config_error_message(config_path: str, error: Exception) -> str:
     """把配置读取失败转成可读的中文错误（不打印栈）。"""
     return (
@@ -262,6 +283,10 @@ def main(argv: list[str] | None = None) -> int:
             print(_stage_error_message(args.command, error), file=sys.stderr)
             return EXIT_STAGE_FAILED
         _print_payload(payload)
+        # 可见告警（如 sidecar 零命中）：打到 stderr，但不改变退出码（仍为 0）。
+        warnings = _payload_warnings(payload)
+        if warnings:
+            print(_warnings_message(args.command, warnings), file=sys.stderr)
         # 部分视频失败（容错跳过）→ 非 0 退出码，让调用方看见，绝不静默。
         failures = _payload_failures(payload)
         if failures:

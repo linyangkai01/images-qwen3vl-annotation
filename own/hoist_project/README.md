@@ -71,7 +71,7 @@ pwsh -File scripts/run_hoist_cycle.ps1
 ```
 
 ```bash
-# lab-server（Linux）全量：完整链路（当前仅 T05 `evaluate` 未实现）
+# lab-server（Linux）全量：完整链路
 bash scripts/run_hoist_cycle.sh
 ```
 
@@ -79,9 +79,9 @@ bash scripts/run_hoist_cycle.sh
 curate → freeze-holdout → train → evaluate`（`doctor` 可随时单独跑）。
 
 > **已实现（可跑）**：`doctor`（T01）、`inventory / extract-video / extract`（T02）、
-> `annotate / prioritize`（T03）、`curate / freeze-holdout / train`（T04）。
-> **仍未实现**：`evaluate`（T05）—— CLI 会明确报「尚未实现」并返回退出码 `2`，
-> **绝不静默成功**。
+> `annotate / prioritize`（T03）、`curate / freeze-holdout / train`（T04）、
+> `evaluate`（T05.1，含固定 holdout 逐类评估与三档判定）。
+> 全部子命令均已实现（CLI 的「尚未实现」集合为空）；`evaluate` 已不再返回退出码 `2`。
 
 ### 退出码约定
 
@@ -119,3 +119,73 @@ holdout 的真实完整性结论（`ok` / `tampered` / `missing` / `not_frozen`�
 （时间戳版本号每轮都不同，无法跨轮对比指标）。版本号**不得**含 `/`、`\`、`..`
 或为绝对路径：它会被拼进 `workspace/datasets/<version>/`，并在同名重建时 `rmtree`，
 故 CLI 对其 **fail-loud** 校验，绝不静默越界删除。
+
+### T05 新增产物
+
+- `workspace/eval/<version>/` —— 逐类评估：`report.json`（逐类 P/R/mAP50 + A/B/C 三档
+  判定）+ `metrics.json`（含误检率与逐帧统计）；
+- `workspace/analysis/hard_examples.jsonl` —— 本轮困难样本（误检 / 漏检 / 低置信 /
+  通道差异），供下一轮优先标注；
+- `workspace/analysis/next_cycle_tasks.md` —— 下一轮任务清单（消费率不足时显式提示）。
+
+## 真实场景配置清单（跑真实素材前必读）
+
+> ⚠️ 本包的**默认值面向 mock / 合成测试**，直接拿去跑真实素材会「静默地什么都不做」。
+> 真实闭环在服务器上暴露了以下问题，跑真实素材**必须**按本清单核对配置。
+> （改动**只落在配置文件**，不新增 CLI 开关、不改母项目 `ProjectConfig`。）
+
+### 1. 初检检测器：`yolo.detector`
+
+- **mock / 合成测试**：`"sidecar"`（读帧旁的 `*.detections.json`）。
+- **真实素材**：**必须**改为 `"ultralytics"`（用真实 YOLO 权重零样本初检）。
+  若沿用 `"sidecar"` 而素材里没有 sidecar 文件，**所有帧都会因「无有效检测」被跳过**，
+  `selected_candidates: 0` 但退出码仍为 `0`。
+  为此 `extract` 会在摘要里给出 **`sidecar_zero_hit` 告警**（并打到 CLI stderr），
+  请据此复核——**有告警不代表有错，但一定说明配置或 sidecar 与预期不符**。
+
+### 2. 质量过滤阈值：`pipeline.quality_thresholds`（可选覆盖）
+
+质量过滤默认阈值假设「**VLM 只纠偏、不新增**」（`max_added=0`）。真实场景下通用 YOLO
+初检漏检严重、VLM 会**大量新增**目标，沿用默认值会把**全部帧剔除**
+（报错 `所有帧都被质量过滤剔除`）。真实素材跑批**必须放宽**，例如：
+
+```json
+{
+  "pipeline": {
+    "quality_thresholds": {
+      "min_confidence": 0.25,
+      "max_added": 20,
+      "max_removed": 10,
+      "max_adjusted": 10,
+      "min_labels": 1
+    }
+  }
+}
+```
+
+- **优先级**：函数显式参数 > 配置文件 `pipeline.quality_thresholds` > 内置默认值；
+- **合法键**（唯一）：`min_confidence / max_added / max_removed / max_adjusted /
+  min_labels`。**未知键一律 fail-loud**（拼错键不会被静默丢弃）；
+- 默认值**刻意不改**——它与母项目 `scripts/curate_video_batch.py` 的命令行默认值对齐，
+  改了会破坏该对齐。真实场景请用**配置文件**覆盖。
+
+### 3. VLM 端点与场景
+
+- `inference.endpoint_policy.mode` **必须**为 `"allowlist"`，并显式列入端点
+  （公网 IP 会被护栏拦死，见上文「关键约定 §3」）；
+- `qwen.provider` 真实场景改为对应私有服务（非 `"mock"`）；
+- `scene` 恒为 `"hoist"`；`knowledge.kb_path` 指向仓库内知识库。
+
+### 4. 素材输入卫生
+
+- 素材目录里 macOS 元数据（`._*` 文件、`__MACOSX/` 目录）与其它隐藏文件会被**跳过并计数**
+  （不静默丢弃）：`manifest.json` 的 `skipped.by_reason` 给出分类统计与样例；
+- 统计**闭合**：`registered + skipped == files_total`。若某类容器（如 `.qt`）未被登记，
+  会进入 `skipped.by_reason.unsupported_suffix` 并列出 `unsupported_suffixes`，
+  **绝不静默丢失时长**。跑真实素材后请核对 `closure_ok` 与 `by_reason`。
+
+### 5. 上游产出前置（annotate 的 fail-loud 护栏）
+
+`annotate` **要求** `workspace/extracted/candidates.jsonl` 存在且非空，否则**直接报错**
+（退出码 `4`），**绝不「退出码 0、产物全空」**。若遇到该报错，说明上游 `extract` 未产出
+候选帧——请先按 §1 / §2 修正配置并重跑 `extract`。
