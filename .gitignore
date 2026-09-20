@@ -95,3 +95,13 @@ _tmp/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ---------------------------------------------------------------------------
+# industrial_hazard_coldstart：自有 / 开源子树隔离
+#   own/*/input/     —— 真实素材派生数据（关键帧），绝不入库
+#   own/*/workspace/ —— 运行产物，可再生产物
+#   open/weights/    —— 下载的开源权重，不入库
+# ---------------------------------------------------------------------------
+own/*/input/
+own/*/workspace/
+open/weights/

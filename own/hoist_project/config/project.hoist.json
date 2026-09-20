@@ -1,0 +1,123 @@
+{
+  "project_name": "吊装作业单场景 YOLO 冷启动（珠海视频 + 宿州照片）",
+  "scene": "hoist",
+  "labels": [
+    "person",
+    "helmet",
+    "vest",
+    "hook",
+    "rigging",
+    "overhead_crane",
+    "spreader",
+    "balance_beam",
+    "load",
+    "pallet",
+    "hopper",
+    "ebike"
+  ],
+  "input": {
+    "frames_dir": "input/frames"
+  },
+  "output": {
+    "workspace_dir": "workspace"
+  },
+  "pipeline": {
+    "frame_step": 1,
+    "max_frames_per_source": 300,
+    "min_detection_confidence": 0.25,
+    "review_confidence_threshold": 0.8,
+    "include_empty_frames": false,
+    "include_review_queue_in_training": false,
+    "train_split": 0.7,
+    "val_split": 0.2,
+    "test_split": 0.1,
+    "seed": 7
+  },
+  "video": {
+    "sample_fps": 1.0,
+    "scale_width": 640,
+    "analysis_width": 160,
+    "decode_backend": "ffmpeg",
+    "ffmpeg_binary": "ffmpeg"
+  },
+  "keyframe": {
+    "enable": true,
+    "motion_min_ratio": 0.002,
+    "pixel_delta_threshold": 25,
+    "dedup_hamming_threshold": 4,
+    "phash_size": 8,
+    "scene_change_threshold": 0.4,
+    "scene_detect_mode": "ffmpeg",
+    "max_keyframes": 400,
+    "min_gap_seconds": 2.0,
+    "force_keep_labels": [
+      "person",
+      "hook",
+      "rigging",
+      "overhead_crane",
+      "load"
+    ]
+  },
+  "knowledge": {
+    "kb_mode": "compressed",
+    "kb_max_chars": 8000,
+    "scene_routing": "rules",
+    "include_ten_no_lift": true,
+    "include_crane_six_forbidden": true
+  },
+  "qwen": {
+    "provider": "private_vlm",
+    "endpoint": "http://119.23.145.227:38091/api/generate",
+    "model": "qwen3-vl:30b-a3b-thinking-q8_0",
+    "prompt_template": "assets/prompts/hoist_zh.md",
+    "api_key_env": "LAB_VLM_TOKEN",
+    "api_key_file": "/data/users/lyk/.secrets/lab_vlm_token.env",
+    "api_key_name": "LAB_VLM_TOKEN",
+    "require_api_key": true,
+    "timeout_seconds": 300,
+    "max_retries": 2,
+    "retry_backoff_seconds": 2.0,
+    "temperature": 0.1,
+    "top_p": 0.9,
+    "max_tokens": 2500,
+    "combined_call": true,
+    "concurrency": 1,
+    "images_mode": "array",
+    "enable_thinking": true,
+    "strip_thinking": true,
+    "json_repair": true
+  },
+  "inference": {
+    "backend": "private_vlm",
+    "max_video_seconds": 60.0,
+    "on_over_limit": "reject",
+    "segment_seconds": 55.0,
+    "endpoint_policy": {
+      "mode": "allowlist",
+      "allowlist": [
+        "119.23.145.227:38091"
+      ]
+    }
+  },
+  "yolo": {
+    "binary": "yolo",
+    "task": "detect",
+    "detector": "sidecar",
+    "trainer": "mock",
+    "weights": "yolo11n.pt",
+    "detector_weights": "yolo11n.pt",
+    "detector_confidence": 0.25,
+    "detector_iou": 0.45,
+    "detector_image_size": 1280,
+    "image_size": 1280,
+    "epochs": 50,
+    "device": "0",
+    "batch": 16,
+    "workers": 8,
+    "patience": 30,
+    "cache": false,
+    "resume": false,
+    "close_mosaic": 10,
+    "save_period": -1
+  }
+}
