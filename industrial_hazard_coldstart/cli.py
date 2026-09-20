@@ -3,10 +3,10 @@
 子命令覆盖完整链路：``inventory / extract-video / extract / annotate /
 prioritize / curate / freeze-holdout / train / evaluate / doctor``。
 
-**已实现**：``doctor``（T01）、``inventory / extract-video / extract``（T02，接线到
-:func:`orchestrator.run_cycle`）。**仍未实现**的子命令一律打印明确的「尚未实现」提示
-并返回**非 0** 退出码（``2``），**绝不静默成功**——既保证 ``--help`` 可用，也让上游
-编排脚本能立刻发现「该阶段还没接上」。
+**已实现**：``doctor``（T01）、``inventory / extract-video / extract``（T02）、
+``annotate / prioritize``（T03，接线到 :func:`orchestrator.run_cycle`）。
+**仍未实现**的子命令一律打印明确的「尚未实现」提示并返回**非 0** 退出码（``2``），
+**绝不静默成功**——既保证 ``--help`` 可用，也让上游编排脚本能立刻发现「该阶段还没接上」。
 
 已实现 / 未实现两个集合**显式声明**（见 :data:`IMPLEMENTED_COMMANDS` /
 :data:`PENDING_COMMANDS`）：**每实现一个阶段，只改这一处**；测试引用常量而非硬编码
@@ -48,13 +48,13 @@ IMPLEMENTED_COMMANDS: tuple[str, ...] = (
     "inventory",
     "extract-video",
     "extract",
+    "annotate",
+    "prioritize",
 )
 
 #: 尚未实现的子命令 → 计划落地的子任务（用于给出可操作的提示）。
 #: **每实现一个阶段，就把对应条目从这里移入 :data:`IMPLEMENTED_COMMANDS`。**
 _PENDING_COMMANDS: dict[str, str] = {
-    "annotate": "T03.2（两段式标注 F4）",
-    "prioritize": "T03.4（主动学习 F6）",
     "curate": "T04.1（质量过滤与版本化数据集 F8）",
     "freeze-holdout": "T04.2（固定 holdout 冻结）",
     "train": "T04.3（YOLO 冷启动训练 F9）",
@@ -82,6 +82,11 @@ _COMMAND_HELP: dict[str, str] = {
     "evaluate": "在固定 holdout 上逐类评估并按 A/B/C 三档判定。",
     "doctor": "环境探活：ffmpeg / VLM 端点 / 端点护栏 / holdout 完整性。",
 }
+
+#: **全部**子命令（单一真源，派生自 :data:`_COMMAND_HELP`，即 argparse 实际注册的子命令）。
+#: 用途：验收断言「已实现 ∪ 未实现 == 全部子命令」——将来新增子命令若忘了归类，
+#: 该覆盖性断言会立刻失败（而不是被「精确快照」悄悄放过）。
+ALL_COMMANDS: tuple[str, ...] = tuple(_COMMAND_HELP)
 
 
 def _build_parser() -> argparse.ArgumentParser:

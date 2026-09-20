@@ -38,6 +38,7 @@ from traffic_cv_closed_loop.config import (
 
 from industrial_hazard_coldstart import models, taxonomy
 from industrial_hazard_coldstart.cli import (
+    ALL_COMMANDS,
     DATA_STAGE_COMMANDS,
     IMPLEMENTED_COMMANDS,
     PENDING_COMMANDS,
@@ -375,16 +376,24 @@ class CliAndDoctorTest(unittest.TestCase):
     PENDING = tuple(sorted(PENDING_COMMANDS))
 
     def test_implemented_and_pending_are_disjoint_and_cover_all(self) -> None:
-        # 两个集合必须互斥，且并集覆盖全部已声明的子命令（doctor 已实现）。
+        # 断言「**不变量**」而非「精确快照」：阶段转正只会改变 IMPLEMENTED / PENDING
+        # 的划分，而不变量永久成立。这样每次 T0x 阶段转正都**无需再改本用例**。
         implemented = set(IMPLEMENTED_COMMANDS)
         pending = set(PENDING_COMMANDS)
+
+        # 不变量 1：两个集合互斥（同一子命令不得既「已实现」又「未实现」）。
         self.assertTrue(implemented.isdisjoint(pending))
+        # 不变量 2：doctor 必须已实现。
         self.assertIn("doctor", implemented)
-        # T02 三个子命令已转正：不应再出现在「未实现」集合里。
-        for command in ("inventory", "extract-video", "extract"):
+        # 不变量 3（单调增长）：已转正的阶段必须**始终**留在 implemented，绝不可回退。
+        for command in ("inventory", "extract-video", "extract", "annotate", "prioritize"):
             self.assertIn(command, implemented)
             self.assertNotIn(command, pending)
-        self.assertEqual(set(DATA_STAGE_COMMANDS), {"inventory", "extract-video", "extract"})
+        # 不变量 4（覆盖性）：已实现 ∪ 未实现 == 全部子命令。
+        # 将来新增子命令却忘了归类时，本断言会立刻失败——这比「精确快照」更本质。
+        self.assertEqual(implemented | pending, set(ALL_COMMANDS))
+        # 数据阶段（供 run_cycle 消费）= 已实现命令（doctor 除外），由常量派生、单一真源。
+        self.assertEqual(set(DATA_STAGE_COMMANDS), implemented - {"doctor"})
 
     def test_help_exit_code_zero(self) -> None:
         with self.assertRaises(SystemExit) as ctx, contextlib.redirect_stdout(io.StringIO()):
