@@ -951,5 +951,98 @@ class InventoryInputHygieneTest(unittest.TestCase):
         self.assertFalse(is_ignorable_media_path(root / "a._b.png", root))
 
 
+# --------------------------------------------------------------------------- #
+# 8. R2 修复：`.qt` 真视频被静默漏掉 + 统计闭合（登记 + 跳过 == 总数）
+# --------------------------------------------------------------------------- #
+class InventorySuffixCoverageTest(unittest.TestCase):
+    """视频白名单必须覆盖真实容器；未登记文件**必须有原因**，统计必须闭合。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_qt_is_registered_as_video(self) -> None:
+        media = self.tmp / "media" / "吊装操作视频-珠海"
+        media.mkdir(parents=True)
+        (media / "中海通-161134.mp4").write_bytes(b"\x00" * 16)
+        (media / "中海通-161201.qt").write_bytes(b"\x00" * 16)  # QuickTime 真视频
+
+        assets = scan_media(self.tmp / "media", "hoist", ffmpeg_binary=None)
+
+        self.assertEqual(len(assets), 2, [a.source_id for a in assets])
+        self.assertTrue(all(a.media_type == "video" for a in assets))
+        self.assertIn("中海通-161201", {a.source_id for a in assets})
+
+    def test_common_containers_in_whitelist(self) -> None:
+        from industrial_hazard_coldstart.inventory import VIDEO_SUFFIXES
+
+        for suffix in (".qt", ".mov", ".mxf", ".vob", ".rmvb", ".asf", ".ogv", ".3g2", ".f4v"):
+            self.assertIn(suffix, VIDEO_SUFFIXES, suffix)
+
+    def test_unknown_suffix_is_counted_not_lost(self) -> None:
+        media = self.tmp / "media"
+        media.mkdir(parents=True)
+        (media / "a.png").write_bytes(encode_png(6, 6, bytes([3] * 108)))
+        (media / "mystery.xyz").write_bytes(b"junk")
+        (media / "另一份.abc").write_bytes(b"junk")
+
+        assets, skipped = scan_media_detailed(self.tmp / "media", "hoist", ffmpeg_binary=None)
+
+        self.assertEqual(len(assets), 1)
+        self.assertEqual(skipped["by_reason"]["unsupported_suffix"], 2)
+        # 未知扩展名要**列出**（下次白名单漏格式时一眼可见）。
+        self.assertEqual(skipped["unsupported_suffixes"], {".abc": 1, ".xyz": 1})
+        self.assertEqual(skipped["count"], 2)
+
+    def test_statistics_are_closed(self) -> None:
+        media = self.tmp / "media" / "宿州照片"
+        media.mkdir(parents=True)
+        (media / "keep.png").write_bytes(encode_png(6, 6, bytes([3] * 108)))
+        (media / "keep.qt").write_bytes(b"\x00" * 16)
+        (media / "._keep.png").write_bytes(b"junk")          # hidden
+        (media / "note.xyz").write_bytes(b"junk")            # unsupported_suffix
+        (media / "README").write_bytes(b"junk")              # not_media（无扩展名）
+        mac = media / "__MACOSX"
+        mac.mkdir()
+        (mac / "._x.jpg").write_bytes(b"junk")               # hidden
+
+        assets, skipped = scan_media_detailed(self.tmp / "media", "hoist", ffmpeg_binary=None)
+
+        files_total = sum(1 for p in (self.tmp / "media").rglob("*") if p.is_file())
+        self.assertEqual(len(assets), 2)
+        self.assertEqual(files_total, 6)
+        # 闭合性：登记 + 跳过 == 目录内文件总数（无「第三态」）。
+        self.assertEqual(len(assets) + skipped["count"], skipped["files_total"])
+        self.assertEqual(skipped["files_total"], files_total)
+        self.assertEqual(
+            skipped["count"],
+            sum(skipped["by_reason"].values()),
+        )
+        self.assertEqual(skipped["by_reason"]["hidden_or_appledouble"], 2)
+        self.assertEqual(skipped["by_reason"]["unsupported_suffix"], 1)
+        self.assertEqual(skipped["by_reason"]["not_media"], 1)
+
+    def test_run_inventory_reports_closure(self) -> None:
+        media = self.tmp / "input" / "media" / "珠海"
+        media.mkdir(parents=True)
+        (media / "v1.mp4").write_bytes(b"\x00" * 16)
+        (media / "v2.qt").write_bytes(b"\x00" * 16)
+        (media / "._v2.qt").write_bytes(b"junk")
+        config = _make_config(self.tmp, ffmpeg_binary="coldstart-no-such-ffmpeg")
+
+        manifest = run_inventory(config)
+
+        self.assertEqual(manifest["counts"]["video"], 2)  # .qt 不再漏
+        self.assertEqual(manifest["counts"]["skipped"], 1)
+        self.assertEqual(manifest["counts"]["files_total"], 3)
+        self.assertTrue(manifest["closure_ok"])
+        on_disk = read_json(config.workspace("inventory", "manifest.json"))
+        self.assertTrue(on_disk["closure_ok"])
+        self.assertEqual(on_disk["skipped"]["by_reason"]["hidden_or_appledouble"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

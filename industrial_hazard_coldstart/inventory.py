@@ -39,6 +39,9 @@ __all__ = [
     "VIDEO_SUFFIXES",
     "HIDDEN_METADATA_DIRNAME",
     "MAX_SKIPPED_SAMPLES",
+    "SKIP_REASON_HIDDEN",
+    "SKIP_REASON_UNSUPPORTED",
+    "SKIP_REASON_NOT_MEDIA",
     "default_media_root",
     "is_ignorable_media_path",
     "scan_media",
@@ -47,22 +50,39 @@ __all__ = [
 ]
 
 #: 视为「视频」的扩展名（编目分流用；与 imageio 支持的照片扩展名互斥）。
+#:
+#: **必须覆盖真实素材里出现的容器**——漏一个就会**静默漏掉整段素材**（R2 缺陷：
+#: 珠海目录的 ``.qt`` 真视频占总时长 52.7% 却被漏搜）。故这里覆盖主流容器：
+#: MP4/MOV/QuickTime、AVI、MKV/WebM、WMV/ASF、FLV/F4V、MPEG 家族、传输流、
+#: MXF/VOB/DV、RealMedia、Ogg、3GP/3G2 等。
 VIDEO_SUFFIXES: frozenset[str] = frozenset(
     {
         ".mp4",
         ".m4v",
         ".mov",
+        ".qt",          # QuickTime（Mac 常见；R2 补入）
         ".avi",
         ".mkv",
         ".flv",
+        ".f4v",         # Flash MP4
         ".wmv",
+        ".asf",         # Advanced Systems Format（WMV 容器）
         ".webm",
+        ".ogv",         # Ogg video
         ".mpg",
         ".mpeg",
+        ".m2v",         # MPEG-2 视频基本流
         ".ts",
         ".mts",
         ".m2ts",
         ".3gp",
+        ".3g2",         # 3GPP2
+        ".mxf",         # Material Exchange Format（专业视频）
+        ".vob",         # DVD Video Object
+        ".dv",          # DV
+        ".rm",          # RealMedia
+        ".rmvb",        # RealMedia 可变码率
+        ".divx",        # DivX
     }
 )
 
@@ -71,6 +91,11 @@ HIDDEN_METADATA_DIRNAME: str = "__MACOSX"
 
 #: 跳过清单里最多记录多少条样例（避免 manifest 膨胀；数量仍为全量）。
 MAX_SKIPPED_SAMPLES: int = 20
+
+#: 未登记文件的原因标签（**每个未登记文件都必须有原因**，绝不静默）。
+SKIP_REASON_HIDDEN: str = "hidden_or_appledouble"   # 隐藏文件/目录 / macOS 元数据
+SKIP_REASON_UNSUPPORTED: str = "unsupported_suffix"  # 扩展名不在视频/图片白名单
+SKIP_REASON_NOT_MEDIA: str = "not_media"             # 无扩展名的文件
 
 #: Netpbm 系列（母项目 ``imageio`` 可直接读，无需 ffprobe）。
 _NETPBM_SUFFIXES: frozenset[str] = frozenset({".pgm", ".ppm", ".pnm", ".pbm"})
@@ -277,8 +302,12 @@ def scan_media_detailed(
 ) -> tuple[list[MediaAsset], dict[str, Any]]:
     """递归扫描 ``root``，返回 ``(素材清单, 跳过统计)``。
 
-    与 :func:`scan_media` 同口径，但额外返回**被跳过**的隐藏 / macOS 元数据统计，
-    使调用方**看得见**少登记了多少（本项目「绝不静默」的既定规矩）。
+    与 :func:`scan_media` 同口径，但额外返回**被跳过**文件的分类统计，使调用方
+    **看得见**少登记了什么（本项目「绝不静默」的既定规矩）。
+
+    **统计闭合性（根本判据）**：``len(assets) + skipped["count"] == skipped["files_total"]``，
+    即目录内**每个文件**要么被登记、要么被计入某个 ``by_reason``——**不存在
+    「既没登记、也没跳过」的第三态**（R2 缺陷的根因：``.qt`` 真视频两头都不在）。
 
     Args:
         root: 媒体素材根目录（可含中文）。
@@ -286,32 +315,80 @@ def scan_media_detailed(
         ffmpeg_binary: ffmpeg 可执行路径；``None`` 时视频只登记路径、不读容器头。
 
     Returns:
-        ``(assets, skipped)``：``assets`` 按路径排序；``skipped`` 形如
-        ``{"count": int, "samples": [str, ...]}``（``samples`` 至多
-        :data:`MAX_SKIPPED_SAMPLES` 条，``count`` 为全量）。
+        ``(assets, skipped)``：``assets`` 按路径排序；``skipped`` 形如::
+
+            {
+              "count": int,                    # == by_reason 之和
+              "files_total": int,              # 目录内文件总数（含隐藏）
+              "by_reason": {
+                  "hidden_or_appledouble": int,
+                  "unsupported_suffix": int,
+                  "not_media": int,
+              },
+              "unsupported_suffixes": {".xyz": 2, ...},   # 未知扩展名 → 数量
+              "samples": [相对路径, ...],       # 至多 MAX_SKIPPED_SAMPLES 条
+            }
     """
     root = Path(root)
     if not root.exists():
-        return [], {"count": 0, "samples": []}
+        return [], {
+            "count": 0,
+            "files_total": 0,
+            "by_reason": {
+                SKIP_REASON_HIDDEN: 0,
+                SKIP_REASON_UNSUPPORTED: 0,
+                SKIP_REASON_NOT_MEDIA: 0,
+            },
+            "unsupported_suffixes": {},
+            "samples": [],
+        }
 
     assets: list[MediaAsset] = []
-    skipped_count = 0
-    skipped_samples: list[str] = []
+    files_total = 0
+    by_reason: dict[str, int] = {
+        SKIP_REASON_HIDDEN: 0,
+        SKIP_REASON_UNSUPPORTED: 0,
+        SKIP_REASON_NOT_MEDIA: 0,
+    }
+    unsupported_suffixes: dict[str, int] = {}
+    samples: list[str] = []
+
+    def _record_sample(path: Path) -> None:
+        if len(samples) < MAX_SKIPPED_SAMPLES:
+            samples.append(_skipped_relative(path, root))
+
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
+        files_total += 1
         # 输入卫生：跳过隐藏文件 / 隐藏目录 / macOS 元数据（._* / __MACOSX）。
         if is_ignorable_media_path(path, root):
-            skipped_count += 1
-            if len(skipped_samples) < MAX_SKIPPED_SAMPLES:
-                skipped_samples.append(_skipped_relative(path, root))
+            by_reason[SKIP_REASON_HIDDEN] += 1
+            _record_sample(path)
             continue
         suffix = path.suffix.lower()
         if suffix in VIDEO_SUFFIXES:
             assets.append(_video_asset(path, scene, ffmpeg_binary))
-        elif suffix in SUPPORTED_IMAGE_SUFFIXES:
+            continue
+        if suffix in SUPPORTED_IMAGE_SUFFIXES:
             assets.append(_image_asset(path, root, scene))
-    return assets, {"count": skipped_count, "samples": skipped_samples}
+            continue
+        # 未登记：**必须给出原因**（否则就是 R2 那种「凭空消失」）。
+        if suffix:
+            by_reason[SKIP_REASON_UNSUPPORTED] += 1
+            unsupported_suffixes[suffix] = unsupported_suffixes.get(suffix, 0) + 1
+        else:
+            by_reason[SKIP_REASON_NOT_MEDIA] += 1
+        _record_sample(path)
+
+    skipped: dict[str, Any] = {
+        "count": sum(by_reason.values()),
+        "files_total": files_total,
+        "by_reason": dict(by_reason),
+        "unsupported_suffixes": dict(sorted(unsupported_suffixes.items())),
+        "samples": samples,
+    }
+    return assets, skipped
 
 
 def scan_media(
@@ -359,9 +436,13 @@ def run_inventory(
         "total": len(assets),
         "video": sum(1 for item in assets if item.media_type == "video"),
         "image": sum(1 for item in assets if item.media_type == "image"),
-        # 被跳过的隐藏 / macOS 元数据（不计入 total，但必须可见）。
+        # 被跳过的文件（不计入 total，但必须可见）。
         "skipped": skipped["count"],
+        # 目录内文件总数（含隐藏）；闭合性：total + skipped == files_total。
+        "files_total": skipped["files_total"],
     }
+    # 闭合性自检：每个文件要么登记、要么有跳过原因，绝不「凭空消失」。
+    closure_ok = counts["total"] + counts["skipped"] == counts["files_total"]
     manifest: dict[str, Any] = {
         "scene": resolved_scene,
         "media_root": str(root),
@@ -369,6 +450,7 @@ def run_inventory(
         "assets": [item.to_dict() for item in assets],
         "counts": counts,
         "skipped": skipped,
+        "closure_ok": closure_ok,
     }
 
     manifest_path = config.workspace("inventory", "manifest.json")
@@ -381,6 +463,7 @@ def run_inventory(
         "media_root": str(root),
         "counts": counts,
         "skipped": skipped,
+        "closure_ok": closure_ok,
     }
     write_json(config.workspace("status", "inventory.json"), status)
     return manifest
