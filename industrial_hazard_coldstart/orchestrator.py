@@ -42,6 +42,7 @@ from traffic_cv_closed_loop.io_utils import (
     read_text,
     write_json,
     write_jsonl,
+    write_text,
 )
 from traffic_cv_closed_loop.models import AnnotationRecord
 from traffic_cv_closed_loop.pipeline.annotation import run_annotation
@@ -49,6 +50,17 @@ from traffic_cv_closed_loop.pipeline.extraction import run_extraction
 
 from industrial_hazard_coldstart.active_learning import build_priority_queue
 from industrial_hazard_coldstart.dataset import build_dataset, curate_records
+from industrial_hazard_coldstart.evaluate import (
+    DEFAULT_CONSUMPTION_TARGET,
+    HARD_EXAMPLES_FILENAME,
+    METRICS_FILENAME,
+    NEXT_CYCLE_TASKS_FILENAME,
+    REPORT_FILENAME,
+    build_hard_examples,
+    consumption_rate,
+    evaluate,
+    render_next_cycle_tasks,
+)
 from industrial_hazard_coldstart.holdout import (
     DEFAULT_HOLDOUT_RATIO,
     freeze_holdout,
@@ -76,6 +88,7 @@ __all__ = [
     "run_curate",
     "run_freeze_holdout",
     "run_train",
+    "run_evaluate",
 ]
 
 #: 默认数据集版本号（版本号**不用时间戳**，保证跨轮可比）。
@@ -91,6 +104,7 @@ SUPPORTED_STAGES: tuple[str, ...] = (
     "curate",
     "freeze-holdout",
     "train",
+    "evaluate",
 )
 
 #: 隐患被拒（KB 外 / 场景外）时写入复核队列的原因标记。
@@ -616,6 +630,101 @@ def run_train(
     return report
 
 
+# --------------------------------------------------------------------------- #
+# evaluate 阶段（T05.1 逐类评估 + T05.2 困难样本回流与消费率）
+# --------------------------------------------------------------------------- #
+def run_evaluate(
+    config: ProjectConfig,
+    version: str | None = None,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """执行 ``evaluate`` 阶段：固定 holdout 逐类评估 + 困难样本回流。
+
+    流程：
+
+    1. 从 ``runs/<version>/weights/best.pt`` 取待评估权重（mock 路径可不存在）；
+    2. 读上一轮 ``analysis/hard_examples.jsonl`` 与本轮标注，算**消费率**
+       （判据 ≥ :data:`DEFAULT_CONSUMPTION_TARGET`，需求 §7.5.5「只写不读不算闭环」）；
+    3. :func:`evaluate.evaluate` 在**固定 holdout**（哈希校验通过）上逐类评估并三档判定，
+       产出 ``workspace/eval/<version>/report.json`` + ``metrics.json``；
+    4. 汇总本轮困难样本 → ``workspace/analysis/hard_examples.jsonl`` +
+       ``next_cycle_tasks.md``（供下一轮优先标注 / 消费）。
+
+    Args:
+        config: 项目配置。
+        version: 数据集 / 评估版本号；省略时用 :data:`DEFAULT_DATASET_VERSION`。
+        execute: 是否真正执行 ``yolo val`` / ``yolo predict``（默认否 = mock 路径）。
+
+    Returns:
+        评估摘要（含逐类指标、三档判定、消费率、困难样本计数与各产物路径）。
+    """
+    dataset_version = (
+        str(version).strip() if version is not None else ""
+    ) or DEFAULT_DATASET_VERSION
+
+    holdout_dir = config.workspace("holdout")
+    run_dir = config.runs_dir / dataset_version
+    weights = run_dir / "weights" / "best.pt"
+    eval_dir = config.workspace("eval", dataset_version)
+    analysis_dir = config.workspace("analysis")
+
+    # 消费率：上一轮困难样本 vs 本轮真正进入数据集的标注（dataset_ready）。
+    prev_hard = read_jsonl(analysis_dir / HARD_EXAMPLES_FILENAME)
+    annotations = [
+        AnnotationRecord.from_dict(item) for item in read_jsonl(config.annotations_path)
+    ]
+    consumed = [
+        record.candidate.relative_path for record in annotations if record.dataset_ready
+    ]
+    rate = consumption_rate(prev_hard, consumed)
+
+    report = evaluate(
+        weights,
+        holdout_dir,
+        config,
+        version=dataset_version,
+        eval_dir=eval_dir,
+        execute=execute,
+        consumption=rate,
+    )
+
+    # 困难样本回流：评估逐帧统计（误检/漏检）+ 标注信号（低置信 / 通道差异）。
+    metrics_payload = read_json(eval_dir / METRICS_FILENAME, default={})
+    frame_stats = (
+        metrics_payload.get("per_frame", {}) if isinstance(metrics_payload, dict) else {}
+    )
+    hard_examples = build_hard_examples(config, report, annotations, frame_stats)
+    write_jsonl(analysis_dir / HARD_EXAMPLES_FILENAME, hard_examples)
+    write_text(
+        analysis_dir / NEXT_CYCLE_TASKS_FILENAME,
+        render_next_cycle_tasks(report, hard_examples, rate),
+    )
+
+    consumption_ok = rate >= DEFAULT_CONSUMPTION_TARGET
+    summary: dict[str, Any] = {
+        "stage": "evaluate",
+        "dataset_version": dataset_version,
+        "holdout_hash": report.holdout_hash,
+        "report_path": str((eval_dir / REPORT_FILENAME).resolve()),
+        "metrics_path": str((eval_dir / METRICS_FILENAME).resolve()),
+        "per_class": report.per_class,
+        "tier_verdict": report.tier_verdict,
+        "false_detection_rate": (
+            metrics_payload.get("false_detection_rate", 0.0)
+            if isinstance(metrics_payload, dict)
+            else 0.0
+        ),
+        "consumption_rate": rate,
+        "consumption_target": DEFAULT_CONSUMPTION_TARGET,
+        "consumption_ok": consumption_ok,
+        "hard_example_count": len(hard_examples),
+        "hard_examples_path": str((analysis_dir / HARD_EXAMPLES_FILENAME).resolve()),
+        "next_cycle_tasks_path": str((analysis_dir / NEXT_CYCLE_TASKS_FILENAME).resolve()),
+    }
+    write_json(config.status_dir / "evaluate.json", summary)
+    return summary
+
+
 def run_cycle(
     config: ProjectConfig,
     stage: str,
@@ -635,10 +744,10 @@ def run_cycle(
         video_paths: ``extract-video`` / ``extract`` 使用的显式视频列表。
         media_root: ``inventory`` 使用的素材根目录。
         auto_extract_video: ``extract`` 阶段是否在需要时自动先抽帧。
-        version: ``curate`` / ``freeze-holdout`` / ``train`` 使用的数据集版本号
-            （省略用默认版本）。
+        version: ``curate`` / ``freeze-holdout`` / ``train`` / ``evaluate`` 使用的数据集
+            版本号（省略用默认版本）。
         holdout_ratio: ``curate`` / ``freeze-holdout`` / ``train`` 首次冻结 holdout 的占比。
-        execute: ``train`` 阶段是否真正执行训练。
+        execute: ``train`` / ``evaluate`` 阶段是否真正执行（默认否 = mock 路径）。
 
     Returns:
         阶段摘要字典（``extract`` 结果含母项目 ``run_extraction`` 的全部字段）。
@@ -695,6 +804,12 @@ def run_cycle(
         if holdout_ratio is not None:
             train_kwargs["holdout_ratio"] = holdout_ratio
         return run_train(config, **train_kwargs)
+
+    if normalized == "evaluate":
+        evaluate_kwargs: dict[str, Any] = {"execute": execute}
+        if version is not None:
+            evaluate_kwargs["version"] = version
+        return run_evaluate(config, **evaluate_kwargs)
 
     raise ValueError(
         f"未知阶段：{stage!r}（本批支持：{', '.join(SUPPORTED_STAGES)}）"

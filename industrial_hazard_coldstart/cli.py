@@ -5,9 +5,10 @@ prioritize / curate / freeze-holdout / train / evaluate / doctor``。
 
 **已实现**：``doctor``（T01）、``inventory / extract-video / extract``（T02）、
 ``annotate / prioritize``（T03）、``curate / freeze-holdout``（T04.1 / T04.2）、
-``train``（T04.3）——数据阶段均接线到 :func:`orchestrator.run_cycle`。
+``train``（T04.3）、``evaluate``（T05.1）——数据阶段均接线到 :func:`orchestrator.run_cycle`。
 **仍未实现**的子命令一律打印明确的「尚未实现」提示并返回**非 0** 退出码（``2``），
 **绝不静默成功**——既保证 ``--help`` 可用，也让上游编排脚本能立刻发现「该阶段还没接上」。
+（T05.1 落地后 :data:`PENDING_COMMANDS` 为**空**：全部子命令均已实现。）
 
 已实现 / 未实现两个集合**显式声明**（见 :data:`IMPLEMENTED_COMMANDS` /
 :data:`PENDING_COMMANDS`）：**每实现一个阶段，只改这一处**；测试引用常量而非硬编码
@@ -54,13 +55,13 @@ IMPLEMENTED_COMMANDS: tuple[str, ...] = (
     "curate",
     "freeze-holdout",
     "train",
+    "evaluate",
 )
 
 #: 尚未实现的子命令 → 计划落地的子任务（用于给出可操作的提示）。
 #: **每实现一个阶段，就把对应条目从这里移入 :data:`IMPLEMENTED_COMMANDS`。**
-_PENDING_COMMANDS: dict[str, str] = {
-    "evaluate": "T05.1（固定 holdout 逐类评估 F10）",
-}
+#: T05.1 已落地 ``evaluate``，本映射现为**空**——全部子命令均已实现。
+_PENDING_COMMANDS: dict[str, str] = {}
 
 #: 仍未实现的子命令名集合（供测试引用，避免硬编码子命令名）。
 PENDING_COMMANDS: frozenset[str] = frozenset(_PENDING_COMMANDS)
@@ -119,24 +120,25 @@ def _build_parser() -> argparse.ArgumentParser:
         command_parser = subparsers.add_parser(command, help=help_text)
         add_config_argument(command_parser)
         # 版本号由调用方指定（不用时间戳）→ 跨轮可比；holdout 占比同理。
-        # 这三个阶段都产出 / 消费版本化数据集与固定 holdout。
-        if command in {"curate", "freeze-holdout", "train"}:
+        # 这些阶段都产出 / 消费版本化数据集与固定 holdout。
+        if command in {"curate", "freeze-holdout", "train", "evaluate"}:
             command_parser.add_argument(
                 "--version",
                 default=argparse.SUPPRESS,
                 help="数据集 / 运行版本号（默认 coldstart-v1，非时间戳）。",
             )
+        if command in {"curate", "freeze-holdout", "train"}:
             command_parser.add_argument(
                 "--holdout-ratio",
                 type=float,
                 default=argparse.SUPPRESS,
                 help="首次冻结 holdout 的占比（默认 0.2）。",
             )
-        if command == "train":
+        if command in {"train", "evaluate"}:
             command_parser.add_argument(
                 "--execute",
                 action="store_true",
-                help="真正执行训练（默认只准备命令 / 走 mock）。",
+                help="真正执行（默认只准备命令 / 走 mock）。",
             )
 
     return parser

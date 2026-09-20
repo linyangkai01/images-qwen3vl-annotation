@@ -763,27 +763,12 @@ class CliExitCodeTest(unittest.TestCase):
         self.assertEqual(self._run(["annotate", "--config", str(self.config_path)]), cli.EXIT_READY)
         self.assertEqual(self._run(["prioritize", "--config", str(self.config_path)]), cli.EXIT_READY)
 
-    def test_unimplemented_stage_exits_two(self) -> None:
-        """**未实现**的阶段一律退出 2。
-
-        **断言不变量，不断言快照**：命令名**引用** ``cli.PENDING_COMMANDS``（单一真源），
-        不手抄列表。原用例硬编码 ``("train", "evaluate", "curate", "freeze-holdout")``，
-        T04 把 ``train`` 转正后即假红（实得 4 = 已实现阶段执行失败）；改为遍历常量后，
-        将来再有阶段转正**无需再改本用例**。
-
-        另加空集合守护：若某天全部子命令都已实现，遍历会空转假绿。
-        """
-        pending = sorted(cli.PENDING_COMMANDS)
-        self.assertTrue(
-            pending,
-            "PENDING_COMMANDS 为空：所有子命令都已实现，本用例已空转，"
-            "请删掉它并保留 test_implemented_stages_are_dispatched。",
-        )
-        for command in pending:
-            with self.subTest(command=command):
-                self.assertEqual(self._run([command, "--config", str(self.config_path)]),
-                                 cli.EXIT_NOT_IMPLEMENTED)
-
+    # 【已退役 2026-09-20（T05）】原 ``test_unimplemented_stage_exits_two`` 按自身预埋的
+    # 守护语主动退役：``cli.PENDING_COMMANDS`` 现为空集合（10 个子命令全部实现，含 T05
+    # 转正的 ``evaluate``），该用例已无对象可遍历、只会空转假绿，故删除而非保留。
+    # 「已实现阶段必须真的被派发到编排器、不得落回 pending 分支」的反向不变量由
+    # test_implemented_stages_are_dispatched 继续守护（它仍有效，且随
+    # ``cli.DATA_STAGE_COMMANDS`` 自动覆盖新增阶段）。
     def test_implemented_stages_are_dispatched(self) -> None:
         """反向不变量：已转正的数据阶段必须**真的被派发到编排器**，而非落回 pending 分支。
 

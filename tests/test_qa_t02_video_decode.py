@@ -501,34 +501,11 @@ class CliExitCodeTest(unittest.TestCase):
             cwd=str(ROOT), capture_output=True, text=True,
         )
 
-    def test_pending_commands_return_2(self) -> None:
-        """**未实现**的子命令一律退出 2。
-
-        **断言不变量，不断言快照**：命令名列表**引用** ``cli.PENDING_COMMANDS``
-        （单一真源）而非手抄。阶段转正时只需把命令从 ``cli._PENDING_COMMANDS``
-        移入 ``cli.IMPLEMENTED_COMMANDS``，本用例自动缩短、不会假红——这正是
-        T04 把 ``train`` 转正后本用例必须改写的原因（原用例硬编码 ``train``，
-        转正后实得 4 = 已实现阶段执行失败）。
-
-        同时守护「空集合」退化：若某天全部子命令都已实现，遍历会空转而假绿，
-        故显式断言集合非空，提醒维护者改写本用例。
-        """
-        pending = sorted(cli.PENDING_COMMANDS)
-        self.assertTrue(
-            pending,
-            "PENDING_COMMANDS 为空：所有子命令都已实现，本用例已空转，"
-            "请删掉它并保留 test_implemented_commands_never_return_2。",
-        )
-        for command in pending:
-            with self.subTest(command=command):
-                result = self._run_cli("--config", str(HOIST_CONFIG), command)
-                self.assertEqual(
-                    result.returncode,
-                    cli.EXIT_NOT_IMPLEMENTED,
-                    f"`{command}` 声明为未实现，退出码应为 2；stderr={result.stderr[:300]}",
-                )
-                self.assertIn("尚未实现", result.stderr)
-
+    # 【已退役 2026-09-20（T05）】原 ``test_pending_commands_return_2`` 按自身预埋的
+    # 守护语主动退役：``cli.PENDING_COMMANDS`` 现为空集合（10 个子命令全部实现），
+    # 该用例已无对象可遍历、只会空转假绿，故删除而非保留。
+    # 「已实现子命令不得返回 2」的反向不变量由 test_implemented_commands_never_return_2
+    # 继续守护（它仍有效，且随 ``cli.IMPLEMENTED_COMMANDS`` 自动覆盖新增阶段）。
     def test_implemented_commands_never_return_2(self) -> None:
         """反向不变量：已转正的子命令**绝不能**再返回 2（2 是「尚未实现」专用码）。
 
