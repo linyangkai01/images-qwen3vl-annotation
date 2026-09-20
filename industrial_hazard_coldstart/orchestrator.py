@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,29 @@ SUPPORTED_STAGES: tuple[str, ...] = (
 #: 隐患被拒（KB 外 / 场景外）时写入复核队列的原因标记。
 REVIEW_REASON_HAZARD_OUT_OF_VOCAB = "hazard_id_not_in_kb"
 
+#: 模型「答了目标但取不到隐患报告」时写入复核队列的原因标记。
+#:
+#: 用于把「模型没答隐患题」（通道 B 静默为空）与「本帧确实没有隐患」区分开——
+#: 二者若都不报错、都产出 ``hazards: []``，人工将无法察觉前者，是本项目的头号失败模式。
+REVIEW_REASON_HAZARD_REPORT_MISSING = "hazard_report_missing"
+
+#: 载荷里可能包裹模型输出的容器键（用于「多包一层」的容错）。
+_PAYLOAD_CONTAINER_KEYS: tuple[str, ...] = (
+    "parsed",
+    "result",
+    "data",
+    "output",
+    "message",
+    "content",
+    "response",
+)
+
+#: 解开嵌套容器的最大深度（防病态输入导致无限递归）。
+_MAX_UNWRAP_DEPTH: int = 4
+
+#: 判定「模型已作答」的输出键：出现任一即说明模型产出了结构化输出。
+_MODEL_OUTPUT_KEYS: tuple[str, ...] = ("objects", "hazard_report", "hazards")
+
 
 def _needs_video_extract(
     config: ProjectConfig,
@@ -80,41 +104,104 @@ def _needs_video_extract(
 # --------------------------------------------------------------------------- #
 # annotate 阶段（T03.2 两段式标注 + T03.3 语义层受控词表 / KB 回填）
 # --------------------------------------------------------------------------- #
-def _extract_hazard_from_raw(raw_payload: Any) -> dict[str, Any]:
-    """从 ``raw_responses/*.json`` 里取出 ``hazard_report``。
+def _decode_json_string(value: Any) -> Any:
+    """若 ``value`` 是 JSON 对象/数组字符串，解码**一次**；否则原样返回。
 
-    真实途径的 ``annotate`` 会把解析后的完整载荷存进 ``parsed``（含 ``hazard_report``），
-    故优先看 ``parsed.hazard_report``；同时兼容顶层直接挂 ``hazard_report`` 的形态。
+    真实模型（尤其 thinking 模型）偶尔把整个 JSON **二次编码**成字符串塞进某字段。
+    这里只在字符串以 ``{`` / ``[`` 开头时才尝试解析，避免对普通文本做无谓解析；
+    解析失败则原样返回（绝不因容错而抛错）。
     """
-    if not isinstance(raw_payload, dict):
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if text[:1] not in ("{", "["):
+        return value
+    try:
+        return json.loads(text)
+    except (ValueError, TypeError):
+        return value
+
+
+def _locate_model_output(payload: Any, depth: int = 0) -> dict[str, Any] | None:
+    """在原始载荷里定位「模型的输出对象」。
+
+    模型输出对象是**含 ``objects`` / ``hazard_report`` / ``hazards`` 任一键的 dict**。
+    为兼容真实 VLM 的多种吐法，逐层解开：
+
+    - 二次编码的 JSON 字符串（:func:`_decode_json_string`）；
+    - 列表包裹（取首个命中的元素）；
+    - 一层或多层容器键（``parsed`` / ``result`` / ``data`` / ``output`` / ``response`` …），
+      深度上限 :data:`_MAX_UNWRAP_DEPTH`。
+
+    找不到返回 ``None``。
+    """
+    payload = _decode_json_string(payload)
+    if isinstance(payload, list):
+        for item in payload:
+            found = _locate_model_output(item, depth + 1)
+            if found is not None:
+                return found
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if any(key in payload for key in _MODEL_OUTPUT_KEYS):
+        return payload
+    if depth >= _MAX_UNWRAP_DEPTH:
+        return None
+    for key in _PAYLOAD_CONTAINER_KEYS:
+        if key in payload:
+            found = _locate_model_output(payload[key], depth + 1)
+            if found is not None:
+                return found
+    return None
+
+
+def _extract_hazard_from_raw(raw_payload: Any) -> dict[str, Any]:
+    """从一帧的原始载荷里取出 ``hazard_report``。
+
+    先定位模型输出对象（容忍二次编码 / 多包一层，见 :func:`_locate_model_output`），
+    再取其 ``hazard_report``（同样容忍二次编码）；若定位到的对象**本身就是报告**
+    （顶层直接是 ``{"hazards": [...]}``），则直接返回它。任何形态都取不到时返回 ``{}``。
+    """
+    output = _locate_model_output(raw_payload)
+    if output is None:
         return {}
-    top_level = raw_payload.get("hazard_report")
-    if isinstance(top_level, dict):
-        return top_level
-    parsed = raw_payload.get("parsed")
-    if isinstance(parsed, dict):
-        nested = parsed.get("hazard_report")
-        if isinstance(nested, dict):
-            return nested
+    report = _decode_json_string(output.get("hazard_report"))
+    if isinstance(report, dict):
+        return report
+    if "hazards" in output:  # 定位到的对象本身就是隐患报告
+        return output
     return {}
 
 
-def _hazard_report_for(
+def _model_produced_output(raw_payload: Any) -> bool:
+    """判断模型是否产出了可识别的输出（输出对象含 ``objects`` 键）。
+
+    用于区分「**模型答了但没给 hazard_report**」与「**这帧本来就没隐患**」——
+    只有前者才应被判为异常（否则会把「场景确实干净」误报成失败）。
+    """
+    output = _locate_model_output(raw_payload)
+    return isinstance(output, dict) and "objects" in output
+
+
+def _model_output_for(
     annotator: Any,
     record: AnnotationRecord,
 ) -> dict[str, Any]:
-    """取一帧的模型隐患报告。
+    """取一帧的**原始模型输出载荷**（供 :func:`_extract_hazard_from_raw` 解析）。
 
-    - **mock 途径**：直接调 ``annotate_combined``（离线、零成本），它会读取
-      ``*.hazard.json`` 侧车或 ``*.qwen.json`` 里的内嵌 ``hazard_report``；
+    - **mock 途径**：直接调 ``annotate_combined``（离线、零成本），它返回的合并载荷
+      同时含 ``objects`` 与 ``hazard_report``（读 ``*.hazard.json`` 侧车或 ``*.qwen.json``
+      里内嵌的 ``hazard_report``）；
     - **真实途径**：复用 ``run_annotation`` 已写下的原始响应，**不重复调用 VLM**
       （避免把昂贵的网络调用翻倍）。
     """
     if isinstance(annotator, MockQwenAnnotator):
         prompt_text = read_text(Path(record.prompt_path))
-        _, hazard_report, _ = annotator.annotate_combined(record.candidate, prompt_text)
-        return hazard_report if isinstance(hazard_report, dict) else {}
-    return _extract_hazard_from_raw(read_json(Path(record.raw_response_path), default={}))
+        _, _, combined = annotator.annotate_combined(record.candidate, prompt_text)
+        return combined if isinstance(combined, dict) else {}
+    raw = read_json(Path(record.raw_response_path), default={})
+    return raw if isinstance(raw, dict) else {}
 
 
 def _augment_review_queue(
@@ -171,7 +258,11 @@ def run_annotate(config: ProjectConfig) -> dict[str, Any]:
     3. 逐帧取模型隐患报告，做 :func:`knowledge.backfill_hazards`：
        ``category / norm_reference / action`` **全部由 KB 回填**；KB 外 / 场景外的
        ``hazard_id`` **一律拒绝**并记入复核；
-    4. 落盘 ``workspace/hazards/report.json`` 与 ``workspace/hazards/rejected.jsonl``。
+    4. **静默失败护栏**（QA-T03-01）：若某帧「模型答了（有 ``objects``）却取不到可用
+       ``hazard_report``」，计入 ``counts.frames_without_hazard_report`` 并按
+       ``hazard_report_missing`` 原因补进复核队列——把「模型没答隐患题」与
+       「本帧确实没有隐患」区分开（二者否则完全不可区分）；
+    5. 落盘 ``workspace/hazards/report.json`` 与 ``workspace/hazards/rejected.jsonl``。
 
     Returns:
         阶段摘要（含标注摘要与隐患回填统计）。
@@ -190,13 +281,22 @@ def run_annotate(config: ProjectConfig) -> dict[str, Any]:
     rejected: list[dict[str, Any]] = []
     frames: list[dict[str, Any]] = []
     frames_needing_review: set[str] = set()
+    frames_without_report: set[str] = set()
     model_overall = ""
 
     for record in records:
         relative_path = record.candidate.relative_path
-        hazard_report = _hazard_report_for(annotator, record)
-        if isinstance(hazard_report, dict) and not model_overall:
+        model_output = _model_output_for(annotator, record)
+        hazard_report = _extract_hazard_from_raw(model_output)
+        if hazard_report and not model_overall:
             model_overall = str(hazard_report.get("overall_risk", "") or "")
+
+        # 护栏（QA-T03-01）：模型「答了目标却取不到隐患报告」→ 显式标记。
+        # 只在「有 objects（说明模型答了）」却「无可用 hazard_report」时判定为异常，
+        # 绝不把「本帧确实没有隐患」误报成失败。
+        report_missing = not hazard_report and _model_produced_output(model_output)
+        if report_missing:
+            frames_without_report.add(relative_path)
 
         frame_resolved, frame_rejected = backfill_hazards(
             hazard_report, kb, allowed_ids, source_frame=relative_path
@@ -211,11 +311,16 @@ def run_annotate(config: ProjectConfig) -> dict[str, Any]:
                 "model_hazard_count": len(extract_model_hazards(hazard_report)),
                 "resolved_ids": [item["hazard_id"] for item in frame_resolved],
                 "rejected_ids": [item["hazard_id"] for item in frame_rejected],
+                "hazard_report_present": bool(hazard_report),
             }
         )
 
+    # 两类复核原因分别补进队列（同一路径下原因会累加，不会互相覆盖）。
     added_to_queue = _augment_review_queue(
         config, frames_needing_review, REVIEW_REASON_HAZARD_OUT_OF_VOCAB
+    )
+    added_missing = _augment_review_queue(
+        config, frames_without_report, REVIEW_REASON_HAZARD_REPORT_MISSING
     )
 
     report = {
@@ -233,6 +338,7 @@ def run_annotate(config: ProjectConfig) -> dict[str, Any]:
             "hazards_resolved": len(hazards),
             "hazards_rejected": len(rejected),
             "frames_with_rejected_hazard": len(frames_needing_review),
+            "frames_without_hazard_report": len(frames_without_report),
         },
     }
     write_json(config.hazard_report_path, report)
@@ -246,7 +352,8 @@ def run_annotate(config: ProjectConfig) -> dict[str, Any]:
         "hazards_resolved": len(hazards),
         "hazards_rejected": len(rejected),
         "frames_with_rejected_hazard": len(frames_needing_review),
-        "review_queue_added": added_to_queue,
+        "frames_without_hazard_report": len(frames_without_report),
+        "review_queue_added": added_to_queue + added_missing,
         "overall_risk": report["overall_risk"],
     }
     write_json(config.workspace("status", "annotate.json"), summary)

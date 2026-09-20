@@ -199,11 +199,24 @@ class KnowledgeBase:
     def allowed_hazard_ids(self, scene: str) -> list[str]:
         """返回配置场景（如 ``hoist``）允许引用的受控隐患 id 列表。
 
+        受控词表 = **该场景自身的隐患** + **通用场景（S3）的隐患**：
+        S3 名为「通用隐患」（如「场地积水」），**对所有作业场景都适用**，故一律并入
+        （见 ARCH §2.2 / REQ §4.2.7：吊装受控词表 = S1 27 条 + S3 通用 1 条 = 28 条）。
+
         配置场景经 :data:`SCENE_TO_KB_SCENE_ID` 映射到知识库 ``scene_id``；
         映射不到时尝试把 ``scene`` 直接当作 ``scene_id``（大小写不敏感）。
         未知场景返回空列表——**空即全拒**（宁缺毋滥）。
+        当 ``scene`` 本身就是 S3 时不会重复并入（结果与 :meth:`scene_hazard_ids` 一致）。
         """
-        return self.scene_hazard_ids(self.scene_id_for(scene))
+        scene_id = self.scene_id_for(scene)
+        if not scene_id:
+            return []
+        ids = list(self.scene_hazard_ids(scene_id))
+        if scene_id != GENERIC_KB_SCENE_ID:
+            for generic_id in self.scene_hazard_ids(GENERIC_KB_SCENE_ID):
+                if generic_id not in ids:
+                    ids.append(generic_id)
+        return ids
 
 
 # --------------------------------------------------------------------------- #

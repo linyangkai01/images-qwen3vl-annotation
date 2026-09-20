@@ -40,7 +40,10 @@ from industrial_hazard_coldstart.knowledge import (
     load_knowledge_base,
     resolve_hazard,
 )
-from industrial_hazard_coldstart.orchestrator import run_cycle
+from industrial_hazard_coldstart.orchestrator import (
+    _extract_hazard_from_raw,
+    run_cycle,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 HOIST_CONFIG = ROOT / "own" / "hoist_project" / "config" / "project.hoist.json"
@@ -525,7 +528,122 @@ class ActiveLearningTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# 5. CLI 接线
+# 5. QA-T03 修复回归（静默失败护栏 + S3 通用词表 + 载荷容错）
+# --------------------------------------------------------------------------- #
+class T03FixRegressionTest(unittest.TestCase):
+    """锁定 QA-T03-01 / 02 / 03 的修复行为（工程师自测，与 QA 独立）。"""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.config = _make_config(self.tmp)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_extract_hazard_from_raw_tolerates_common_shapes(self) -> None:
+        report = {"hazards": [{"id": "D-5-1", "evidence": "未戴帽"}], "overall_risk": "high"}
+        cases = {
+            "top-level": {"hazard_report": report},
+            "parsed dict": {"parsed": {"objects": [], "hazard_report": report}},
+            "double-encoded str": {"parsed": {"objects": [], "hazard_report": json.dumps(report)}},
+            "wrapped deeper": {"parsed": {"result": {"objects": [], "hazard_report": report}}},
+            "parsed is json str": {"parsed": json.dumps(report)},
+            "parsed is list": {"parsed": [{"hazard_report": report}]},
+            "ollama native response": {
+                "provider": "private_vlm",
+                "response": json.dumps({"objects": [], "hazard_report": report}),
+            },
+        }
+        for name, payload in cases.items():
+            with self.subTest(shape=name):
+                self.assertEqual(_extract_hazard_from_raw(payload), report)
+
+    def test_extract_hazard_from_raw_returns_empty_when_absent(self) -> None:
+        for payload in (
+            {"parsed": {"objects": [{"label": "person"}]}},
+            {"parsed": {"objects": [], "hazard_report": None}},
+            {"parsed": None},
+            None,
+            "not-a-dict",
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual(_extract_hazard_from_raw(payload), {})
+
+    def test_missing_hazard_report_is_counted_and_queued(self) -> None:
+        """模型答了目标但没给 hazard_report → 计数 + 复核（与「本帧无隐患」区分）。"""
+        candidates = [
+            _make_candidate(
+                self.config,
+                "clip/frame_000001.png",
+                yolo_detections=[
+                    {"label": "person", "bbox": [0.1, 0.1, 0.3, 0.5], "confidence": 0.9}
+                ],
+                qwen_objects=[
+                    {"label": "person", "bbox": [0.1, 0.1, 0.3, 0.5], "confidence": 0.9}
+                ],
+                hazard_report=None,  # 关键：不写隐患侧车
+            )
+        ]
+        _write_candidates(self.config, candidates)
+        summary = run_cycle(self.config, "annotate")
+        report = read_json(self.config.hazard_report_path)
+
+        self.assertEqual(report["counts"]["frames_without_hazard_report"], 1)
+        self.assertEqual(summary["frames_without_hazard_report"], 1)
+        self.assertFalse(report["frames"][0]["hazard_report_present"])
+        queue = read_jsonl(self.config.review_queue_path)
+        queued = [
+            item
+            for item in queue
+            if item["candidate"]["relative_path"] == "clip/frame_000001.png"
+        ]
+        self.assertTrue(queued)
+        self.assertIn("hazard_report_missing", queued[0]["review_reasons"])
+
+    def test_clean_frame_with_empty_hazards_is_not_flagged(self) -> None:
+        """模型明确给出空隐患报告 → 不得误报为「没答」。"""
+        candidates = [
+            _make_candidate(
+                self.config,
+                "clip/frame_000001.png",
+                yolo_detections=[
+                    {"label": "person", "bbox": [0.1, 0.1, 0.3, 0.5], "confidence": 0.9}
+                ],
+                qwen_objects=[
+                    {"label": "person", "bbox": [0.1, 0.1, 0.3, 0.5], "confidence": 0.9}
+                ],
+                hazard_report={"hazards": [], "overall_risk": "none"},
+            )
+        ]
+        _write_candidates(self.config, candidates)
+        run_cycle(self.config, "annotate")
+        report = read_json(self.config.hazard_report_path)
+        self.assertEqual(report["counts"]["frames_without_hazard_report"], 0)
+        self.assertTrue(report["frames"][0]["hazard_report_present"])
+
+    def test_generic_s3_hazard_allowed_in_hoist(self) -> None:
+        """S3 通用隐患（T-1）应纳入吊装受控词表 → 28 条，且回填来自 KB。"""
+        kb = load_knowledge_base(KB_PATH)
+        allowed = kb.allowed_hazard_ids("hoist")
+        self.assertEqual(len(allowed), 28)
+        self.assertIn("T-1", allowed)
+        entry = kb.get("T-1")
+        resolved, rejected = backfill_hazards(
+            {"hazards": [{"id": "T-1", "evidence": "地面有水渍"}]}, kb, frozenset(allowed)
+        )
+        self.assertEqual(rejected, [])
+        self.assertEqual(resolved[0]["norm_reference"], entry.norm_reference)
+        self.assertEqual(resolved[0]["action"], entry.action)
+
+    def test_prompt_lists_generic_s3_hazard(self) -> None:
+        template = HOIST_PROMPT.read_text(encoding="utf-8")
+        self.assertIn("T-1", template)
+        self.assertIn("28 条", template)
+
+
+# --------------------------------------------------------------------------- #
+# 6. CLI 接线
 # --------------------------------------------------------------------------- #
 class CliWiringTest(unittest.TestCase):
     def test_annotate_and_prioritize_are_implemented(self) -> None:
