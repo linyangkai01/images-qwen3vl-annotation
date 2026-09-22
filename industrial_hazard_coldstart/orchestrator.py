@@ -11,6 +11,10 @@
   做两段式复核标注（产出 ``labels/`` + ``annotations.jsonl`` + ``review_queue.jsonl``），
   随后对模型返回的隐患做**受控词表校验 + 本地 KB 回填**，产出
   ``workspace/hazards/report.json``；
+- ``rebuild-hazards`` —— **只重建** ``workspace/hazards/report.json``（从现有
+  ``annotations.jsonl`` + ``raw_responses`` 重算），**不调用 VLM、不重新标注、不读
+  candidates.jsonl**。用于给旧代码产出的报告补上新字段（如幻觉过滤标记），
+  省下整轮标注耗时（:func:`rebuild_hazard_report`）；
 - ``prioritize``（T03.4）—— 对标注记录做不确定性采样，产出
   ``workspace/review/priority_queue.jsonl``；
 - ``curate``（T04.1）—— 质量过滤 + 版本化数据集构建（:func:`run_curate`）；
@@ -29,7 +33,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from traffic_cv_closed_loop.adapters.qwen import MockQwenAnnotator, build_qwen_annotator
 from traffic_cv_closed_loop.adapters.yolo import build_trainer
@@ -40,6 +44,7 @@ from traffic_cv_closed_loop.io_utils import (
     read_json,
     read_jsonl,
     read_text,
+    stem_sidecar,
     write_json,
     write_jsonl,
     write_text,
@@ -78,12 +83,14 @@ from industrial_hazard_coldstart.knowledge import (
     overall_risk_of,
     recommendation_of,
 )
+from industrial_hazard_coldstart.taxonomy import layer_of_hazard
 from industrial_hazard_coldstart.video_decode import discover_videos, run_video_extract
 
 __all__ = [
     "SUPPORTED_STAGES",
     "run_cycle",
     "run_annotate",
+    "rebuild_hazard_report",
     "run_prioritize",
     "run_curate",
     "run_freeze_holdout",
@@ -100,6 +107,7 @@ SUPPORTED_STAGES: tuple[str, ...] = (
     "extract-video",
     "extract",
     "annotate",
+    "rebuild-hazards",
     "prioritize",
     "curate",
     "freeze-holdout",
@@ -319,54 +327,31 @@ def _augment_review_queue(
     return added
 
 
-def run_annotate(config: ProjectConfig) -> dict[str, Any]:
-    """执行 ``annotate`` 阶段：两段式标注 + 隐患受控词表校验与本地回填。
+def _build_hazard_report(
+    config: ProjectConfig,
+    records: list[AnnotationRecord],
+    model_output_provider: Callable[[AnnotationRecord], dict[str, Any]],
+) -> tuple[dict[str, Any], set[str], set[str]]:
+    """逐帧取模型输出 → KB 回填 → 组装隐患报告（**不落盘、不增补复核队列**）。
 
-    流程：
+    抽出来供两条路径共用，保证「正常标注」与「只重建报告」产出的 ``report.json``
+    **结构完全一致**：
 
-    1. **复用**母项目 :func:`traffic_cv_closed_loop.pipeline.annotation.run_annotation`
-       完成两段式复核标注，产出 ``workspace/review/labels/`` + ``annotations.jsonl``
-       + ``review_queue.jsonl``（**不重写标注逻辑**）；
-    2. 加载本地知识库，取当前场景（``hoist`` → ``S1``）的**受控隐患 id 集合**；
-    3. 逐帧取模型隐患报告，做 :func:`knowledge.backfill_hazards`：
-       ``category / norm_reference / action`` **全部由 KB 回填**；KB 外 / 场景外的
-       ``hazard_id`` **一律拒绝**并记入复核；
-    4. **静默失败护栏**（QA-T03-01）：若某帧「模型答了（有 ``objects``）却取不到可用
-       ``hazard_report``」，计入 ``counts.frames_without_hazard_report`` 并按
-       ``hazard_report_missing`` 原因补进复核队列——把「模型没答隐患题」与
-       「本帧确实没有隐患」区分开（二者否则完全不可区分）；
-    5. 落盘 ``workspace/hazards/report.json`` 与 ``workspace/hazards/rejected.jsonl``。
+    - :func:`run_annotate`：``model_output_provider`` 走 annotator（真实 = 读原始响应，
+      mock = 读侧车）；
+    - :func:`rebuild_hazard_report`：``model_output_provider`` **只读磁盘**，
+      **绝不构造或调用 annotator**（零 VLM 调用）。
+
+    Args:
+        config: 项目配置。
+        records: 已存在的标注记录（``annotations.jsonl``）。
+        model_output_provider: 取「单帧原始模型输出载荷」的可调用对象。
 
     Returns:
-        阶段摘要（含标注摘要与隐患回填统计）。
-
-    Raises:
-        ValueError: ``candidates.jsonl`` **缺失或为空**——上游 ``extract`` 未产出候选帧。
-            此时**必须 fail-loud**：否则标注会「退出码 0、报告成功」但产物全空，
-            流程显示绿灯而实际什么都没做（真实闭环暴露的 P1 静默缺陷）。
+        ``(report, frames_needing_review, frames_without_report)``。
     """
-    # P1 静默护栏：候选帧清单缺失或为空都必须 fail-loud，绝不「空跑成功」。
-    if not config.candidates_path.exists():
-        raise ValueError(
-            f"未找到候选帧清单 {config.candidates_path}；"
-            "请先运行 `extract` 阶段产出 candidates.jsonl。"
-        )
-    candidates = read_jsonl(config.candidates_path)
-    if not candidates:
-        raise ValueError(
-            f"候选帧清单 {config.candidates_path} 为空；"
-            "上游 `extract` 未产出任何候选帧（属异常），`annotate` 拒绝静默空跑。"
-        )
-
-    annotation_summary = run_annotation(config)
-
     kb = load_knowledge_base(config.kb_path)
     allowed_ids = frozenset(kb.allowed_hazard_ids(config.scene))
-
-    records = [
-        AnnotationRecord.from_dict(item) for item in read_jsonl(config.annotations_path)
-    ]
-    annotator = build_qwen_annotator(config)
 
     hazards: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
@@ -377,7 +362,7 @@ def run_annotate(config: ProjectConfig) -> dict[str, Any]:
 
     for record in records:
         relative_path = record.candidate.relative_path
-        model_output = _model_output_for(annotator, record)
+        model_output = model_output_provider(record)
         hazard_report = _extract_hazard_from_raw(model_output)
         if hazard_report and not model_overall:
             model_overall = str(hazard_report.get("overall_risk", "") or "")
@@ -406,13 +391,15 @@ def run_annotate(config: ProjectConfig) -> dict[str, Any]:
             }
         )
 
-    # 两类复核原因分别补进队列（同一路径下原因会累加，不会互相覆盖）。
-    added_to_queue = _augment_review_queue(
-        config, frames_needing_review, REVIEW_REASON_HAZARD_OUT_OF_VOCAB
-    )
-    added_missing = _augment_review_queue(
-        config, frames_without_report, REVIEW_REASON_HAZARD_REPORT_MISSING
-    )
+    # 幻觉过滤（需求 §8.3）：统计「能力范围外」隐患——几何/时序/OCR/超分辨/图像质量层，
+    # 这些结论由 VLM 文本推断、未经检测验证，已在回填时逐条标记 needs_manual_verification。
+    # 此处给出汇总计数，避免淹没在数十条隐患里被直接采信。**只统计、不过滤**。
+    verification_by_layer: dict[str, int] = {}
+    for item in hazards:
+        if item.get("needs_manual_verification"):
+            layer = layer_of_hazard(item["hazard_id"])
+            verification_by_layer[layer] = verification_by_layer.get(layer, 0) + 1
+    hazards_needing_verification = sum(verification_by_layer.values())
 
     report = {
         "scene_type": config.scene,
@@ -424,30 +411,189 @@ def run_annotate(config: ProjectConfig) -> dict[str, Any]:
         "overall_risk": overall_risk_of(hazards, model_overall),
         "recommendation": recommendation_of(hazards),
         "frames": frames,
+        "verification": {
+            "hazards_needing_verification": hazards_needing_verification,
+            "by_layer": verification_by_layer,
+            "note": (
+                "needs_manual_verification=true 的隐患超出本期交付能力（非目标检测层），"
+                "结论由 VLM 文本推断、未经检测验证，须人工确认；本报告只标记、不过滤。"
+            ),
+        },
         "counts": {
             "frames": len(records),
             "hazards_resolved": len(hazards),
             "hazards_rejected": len(rejected),
+            "hazards_needing_verification": hazards_needing_verification,
             "frames_with_rejected_hazard": len(frames_needing_review),
             "frames_without_hazard_report": len(frames_without_report),
         },
     }
-    write_json(config.hazard_report_path, report)
-    write_jsonl(config.workspace("hazards", "rejected.jsonl"), rejected)
+    return report, frames_needing_review, frames_without_report
 
+
+def _rebuild_model_output_provider(record: AnnotationRecord) -> dict[str, Any]:
+    """**重建专用**的模型输出来源：只读磁盘，**绝不构造或调用 annotator**（零 VLM 调用）。
+
+    优先级：
+
+    1. ``record.raw_response_path``（真实跑批产物：``parsed.hazard_report``）；
+    2. 帧旁 ``*.hazard.json`` 侧车（mock 约定）；
+    3. 仍无 → 返回原始响应，让「模型答了却无报告」护栏（QA-T03-01）照常生效。
+    """
+    raw: dict[str, Any] | None = None
+    raw_path = str(record.raw_response_path or "").strip()
+    if raw_path:
+        loaded = read_json(Path(raw_path), default=None)
+        raw = loaded if isinstance(loaded, dict) else None
+    if raw is not None and _extract_hazard_from_raw(raw):
+        return raw
+    original = str(record.candidate.original_path or "").strip()
+    if original:
+        sidecar = read_json(stem_sidecar(Path(original), "hazard"), default=None)
+        if isinstance(sidecar, dict) and sidecar:
+            return {"hazard_report": sidecar}
+    return raw or {}
+
+
+def run_annotate(config: ProjectConfig) -> dict[str, Any]:
+    """执行 ``annotate`` 阶段：两段式标注 + 隐患受控词表校验与本地回填。
+
+    流程：
+
+    1. **复用**母项目 :func:`traffic_cv_closed_loop.pipeline.annotation.run_annotation`
+       完成两段式复核标注，产出 ``workspace/review/labels/`` + ``annotations.jsonl``
+       + ``review_queue.jsonl``（**不重写标注逻辑**）；
+    2. 加载本地知识库，取当前场景（``hoist`` → ``S1``）的**受控隐患 id 集合**；
+    3. 逐帧取模型隐患报告，做 :func:`knowledge.backfill_hazards`：
+       ``category / norm_reference / action`` **全部由 KB 回填**；KB 外 / 场景外的
+       ``hazard_id`` **一律拒绝**并记入复核；
+    4. **静默失败护栏**（QA-T03-01）：若某帧「模型答了（有 ``objects``）却取不到可用
+       ``hazard_report``」，计入 ``counts.frames_without_hazard_report`` 并按
+       ``hazard_report_missing`` 原因补进复核队列——把「模型没答隐患题」与
+       「本帧确实没有隐患」区分开（二者否则完全不可区分）；
+    5. **幻觉过滤**（需求 §8.3）：对**超出本期交付能力**的隐患（几何 / 时序 / OCR /
+       超分辨 / 图像质量层，共 9 条）逐条加 ``needs_manual_verification`` +
+       ``capability_note`` 标记，并在 ``counts.hazards_needing_verification`` /
+       ``verification`` 给出汇总。**只标记、不过滤**（隐患可能确实存在，只是本期判不准）；
+    6. 落盘 ``workspace/hazards/report.json`` 与 ``workspace/hazards/rejected.jsonl``。
+
+    Returns:
+        阶段摘要（含标注摘要与隐患回填统计）。
+
+    Raises:
+        ValueError: ``candidates.jsonl`` **缺失或为空**——上游 ``extract`` 未产出候选帧。
+            此时**必须 fail-loud**：否则标注会「退出码 0、报告成功」但产物全空，
+            流程显示绿灯而实际什么都没做（真实闭环暴露的 P1 静默缺陷）。
+    """
+    # P1 静默护栏：候选帧清单缺失或为空都必须 fail-loud，绝不「空跑成功」。
+    if not config.candidates_path.exists():
+        raise ValueError(
+            f"未找到候选帧清单 {config.candidates_path}；"
+            "请先运行 `extract` 阶段产出 candidates.jsonl。"
+        )
+    candidates = read_jsonl(config.candidates_path)
+    if not candidates:
+        raise ValueError(
+            f"候选帧清单 {config.candidates_path} 为空；"
+            "上游 `extract` 未产出任何候选帧（属异常），`annotate` 拒绝静默空跑。"
+        )
+
+    annotation_summary = run_annotation(config)
+
+    records = [
+        AnnotationRecord.from_dict(item) for item in read_jsonl(config.annotations_path)
+    ]
+    annotator = build_qwen_annotator(config)
+    report, frames_needing_review, frames_without_report = _build_hazard_report(
+        config, records, lambda record: _model_output_for(annotator, record)
+    )
+
+    # 两类复核原因分别补进队列（同一路径下原因会累加，不会互相覆盖）。
+    added_to_queue = _augment_review_queue(
+        config, frames_needing_review, REVIEW_REASON_HAZARD_OUT_OF_VOCAB
+    )
+    added_missing = _augment_review_queue(
+        config, frames_without_report, REVIEW_REASON_HAZARD_REPORT_MISSING
+    )
+
+    write_json(config.hazard_report_path, report)
+    write_jsonl(config.workspace("hazards", "rejected.jsonl"), report["rejected"])
+
+    counts = report["counts"]
     summary = {
         "stage": "annotate",
         "annotation": annotation_summary,
         "hazard_report_path": str(config.hazard_report_path),
-        "allowed_hazard_count": len(allowed_ids),
-        "hazards_resolved": len(hazards),
-        "hazards_rejected": len(rejected),
-        "frames_with_rejected_hazard": len(frames_needing_review),
-        "frames_without_hazard_report": len(frames_without_report),
+        "allowed_hazard_count": report["allowed_hazard_count"],
+        "hazards_resolved": counts["hazards_resolved"],
+        "hazards_rejected": counts["hazards_rejected"],
+        "hazards_needing_verification": counts["hazards_needing_verification"],
+        "frames_with_rejected_hazard": counts["frames_with_rejected_hazard"],
+        "frames_without_hazard_report": counts["frames_without_hazard_report"],
         "review_queue_added": added_to_queue + added_missing,
         "overall_risk": report["overall_risk"],
     }
     write_json(config.workspace("status", "annotate.json"), summary)
+    return summary
+
+
+def rebuild_hazard_report(config: ProjectConfig) -> dict[str, Any]:
+    """**只重建隐患报告**：从现有 ``annotations.jsonl``（+ ``raw_responses``）重算
+    ``workspace/hazards/report.json``，**不调用 VLM、不重新标注、不读 candidates.jsonl**。
+
+    用途：旧代码启动的长时间标注（如服务器上 12 小时的全量跑批）产出的报告缺少新增字段
+    （如 ``needs_manual_verification`` / ``verification``）。标注的四类产物中只有
+    ``report.json`` 受影响，而标记是在**回填阶段**加的、**不依赖 VLM 重新调用**——
+    故无需重跑标注，从已有产物重建即可（省下整轮标注耗时）。
+
+    **幂等**：同样的输入（``annotations.jsonl`` + 磁盘上的原始响应）重复跑结果一致。
+
+    Args:
+        config: 项目配置。
+
+    Returns:
+        重建摘要（``mode="rebuild"``，明确区别于 ``annotate``，避免误读为跑了 VLM）。
+
+    Raises:
+        ValueError: ``annotations.jsonl`` **缺失或为空**——无源可重建，**fail-loud**
+            （与 :func:`run_annotate` 同一护栏，绝不产出空报告假装成功）。
+    """
+    if not config.annotations_path.exists():
+        raise ValueError(
+            f"未找到标注记录 {config.annotations_path}；"
+            "重建隐患报告需先有 `annotate` 产物（annotations.jsonl）。"
+        )
+    records = [
+        AnnotationRecord.from_dict(item) for item in read_jsonl(config.annotations_path)
+    ]
+    if not records:
+        raise ValueError(
+            f"标注记录 {config.annotations_path} 为空；无源可重建，拒绝产出空报告。"
+        )
+
+    report, _, _ = _build_hazard_report(config, records, _rebuild_model_output_provider)
+    write_json(config.hazard_report_path, report)
+    write_jsonl(config.workspace("hazards", "rejected.jsonl"), report["rejected"])
+
+    counts = report["counts"]
+    summary = {
+        "stage": "rebuild-hazards",
+        "mode": "rebuild",
+        "note": (
+            "由现有 annotations.jsonl + raw_responses 重建隐患报告；"
+            "未调用 VLM、未重新标注、未读 candidates.jsonl。"
+        ),
+        "hazard_report_path": str(config.hazard_report_path),
+        "source_annotations_path": str(config.annotations_path),
+        "annotations_used": len(records),
+        "allowed_hazard_count": report["allowed_hazard_count"],
+        "hazards_resolved": counts["hazards_resolved"],
+        "hazards_rejected": counts["hazards_rejected"],
+        "hazards_needing_verification": counts["hazards_needing_verification"],
+        "verification_by_layer": report["verification"]["by_layer"],
+        "overall_risk": report["overall_risk"],
+    }
+    write_json(config.status_dir / "rebuild-hazards.json", summary)
     return summary
 
 
@@ -829,6 +975,9 @@ def run_cycle(
 
     if normalized == "annotate":
         return run_annotate(config)
+
+    if normalized == "rebuild-hazards":
+        return rebuild_hazard_report(config)
 
     if normalized == "prioritize":
         return run_prioritize(config)

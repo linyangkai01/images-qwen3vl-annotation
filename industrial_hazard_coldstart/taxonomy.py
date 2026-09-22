@@ -51,6 +51,7 @@ __all__ = [
     "LAYER_IMAGE_QUALITY",
     "LAYER_ORDER",
     "LAYER_LABELS_ZH",
+    "LAYER_CAPABILITY_ZH",
     # S1 隐患
     "S1_HAZARD_IDS",
     "S1_HAZARD_NAMES",
@@ -62,6 +63,8 @@ __all__ = [
     "S1_IMAGE_QUALITY_HAZARD_IDS",
     "S1_HAZARD_LAYERS",
     "layer_of_hazard",
+    "hazard_needs_manual_verification",
+    "capability_note_for_hazard",
     # 构造与自检
     "build_taxonomy_classes",
     "build_hazard_capabilities",
@@ -231,6 +234,17 @@ LAYER_NOTES: dict[str, str] = {
     LAYER_IMAGE_QUALITY: "画面整体亮度/清晰度指标（本期部分实现）。",
 }
 
+#: 能力层 → 该层所需的「能力」中文短语（用于「该隐患需 XXX 能力」的人工确认说明）。
+#: 与 :data:`LAYER_LABELS_ZH`（层名）刻意区分：这里是**能力**表述，贴合需求 §8.3 措辞。
+LAYER_CAPABILITY_ZH: dict[str, str] = {
+    LAYER_DETECTION: "目标检测",
+    LAYER_GEOMETRY: "几何关系推理",
+    LAYER_TEMPORAL: "时序分析",
+    LAYER_OCR: "OCR 文字识别",
+    LAYER_SUPER_RESOLUTION: "超分辨 / 细节识别",
+    LAYER_IMAGE_QUALITY: "图像质量评估",
+}
+
 
 # --------------------------------------------------------------------------- #
 # 5. S1 的 27 条隐患 → 能力层
@@ -313,6 +327,41 @@ S1_HAZARD_LAYERS: dict[str, str] = {
 def layer_of_hazard(hazard_id: str) -> str:
     """返回某条 S1 隐患所属的能力层；未知 id 抛 ``KeyError``。"""
     return S1_HAZARD_LAYERS[hazard_id]
+
+
+def hazard_needs_manual_verification(hazard_id: str) -> bool:
+    """判断某条隐患是否**超出本期交付能力**（能力层 ≠ 目标检测层）。
+
+    本期唯一接入交付指标的能力层是**目标检测层**；几何 / 时序 / OCR / 超分辨 / 图像质量
+    层要么「留位不实现」、要么「部分实现但未接入交付指标」。VLM 仍可能凭文本给出这些层的
+    结论，但**未经检测验证**，属疑似幻觉——必须显式标记为待人工确认（见需求 §8.3），
+    否则甲方会误以为「系统能自动判定铭牌标识 / 空间关系」。
+
+    - 非 S1 隐患（如通用 ``T-1``、高处 ``G-x-x``）或未知 id：返回 ``False``（保守，不误标）。
+    """
+    layer = S1_HAZARD_LAYERS.get(str(hazard_id or "").strip())
+    return layer is not None and layer != LAYER_DETECTION
+
+
+def capability_note_for_hazard(hazard_id: str) -> str:
+    """返回「能力范围外」隐患的人工确认说明；检测层 / 未知 id 返回空串。
+
+    说明形如「该隐患需「OCR 文字识别」能力（本期留位未实现），当前结论由 VLM 文本推断，
+    未经检测验证。」——让甲方一眼看出该结论**未经理工层验证**。对「部分实现」的层
+    （如图像质量层）如实标注为「本期仅部分实现、未接入交付指标」，绝不笼统说「未实现」。
+    """
+    layer = S1_HAZARD_LAYERS.get(str(hazard_id or "").strip())
+    if layer is None or layer == LAYER_DETECTION:
+        return ""
+    capability = LAYER_CAPABILITY_ZH.get(layer, LAYER_LABELS_ZH.get(layer, layer))
+    if LAYER_SUPPORTED.get(layer, False):
+        status = "本期仅部分实现、未接入交付指标"
+    else:
+        status = "本期留位未实现"
+    return (
+        f"该隐患需「{capability}」能力（{status}），"
+        "当前结论由 VLM 文本推断，未经检测验证。"
+    )
 
 
 # --------------------------------------------------------------------------- #

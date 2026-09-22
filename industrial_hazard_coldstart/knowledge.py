@@ -28,6 +28,11 @@ from typing import Any
 
 from traffic_cv_closed_loop.io_utils import read_json
 
+from industrial_hazard_coldstart.taxonomy import (
+    capability_note_for_hazard,
+    hazard_needs_manual_verification,
+)
+
 __all__ = [
     # 场景映射
     "SCENE_TO_KB_SCENE_ID",
@@ -150,8 +155,17 @@ class HazardEntry:
         }
 
     def resolved(self, evidence: str, source_frame: str = "") -> dict[str, Any]:
-        """把本条目回填成报告里的一条隐患（``category/norm_reference/action`` 全来自 KB）。"""
-        return {
+        """把本条目回填成报告里的一条隐患（``category/norm_reference/action`` 全来自 KB）。
+
+        对**超出本期交付能力**的隐患（几何 / 时序 / OCR / 超分辨 / 图像质量层），额外加
+        显式人工确认标记（见需求 §8.3）：``needs_manual_verification=True`` +
+        ``capability_note``。它们由 VLM 文本推断、**未经检测验证**，不得与检测层隐患
+        混在一起直接采信——否则甲方会误以为「系统能自动判定铭牌标识 / 空间关系」。
+
+        **只标记、不过滤**：这些隐患可能确实存在，只是本期判不准，故一律保留。
+        检测层隐患**不带**该标记（保持原字段集，避免下游把「未标记」误读为「已复核」）。
+        """
+        item: dict[str, Any] = {
             "hazard_id": self.hazard_id,
             "name": self.name,
             "evidence": str(evidence or ""),
@@ -164,6 +178,10 @@ class HazardEntry:
             "scene_id": self.scene_id,
             "source_frame": source_frame,
         }
+        if hazard_needs_manual_verification(self.hazard_id):
+            item["needs_manual_verification"] = True
+            item["capability_note"] = capability_note_for_hazard(self.hazard_id)
+        return item
 
 
 @dataclass(slots=True)

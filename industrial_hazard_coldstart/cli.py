@@ -1,11 +1,12 @@
 """命令行入口与子命令。
 
 子命令覆盖完整链路：``inventory / extract-video / extract / annotate /
-prioritize / curate / freeze-holdout / train / evaluate / doctor``。
+rebuild-hazards / prioritize / curate / freeze-holdout / train / evaluate / doctor``。
 
 **已实现**：``doctor``（T01）、``inventory / extract-video / extract``（T02）、
-``annotate / prioritize``（T03）、``curate / freeze-holdout``（T04.1 / T04.2）、
-``train``（T04.3）、``evaluate``（T05.1）——数据阶段均接线到 :func:`orchestrator.run_cycle`。
+``annotate / rebuild-hazards / prioritize``（T03）、``curate / freeze-holdout``
+（T04.1 / T04.2）、``train``（T04.3）、``evaluate``（T05.1）——数据阶段均接线到
+:func:`orchestrator.run_cycle`。
 **仍未实现**的子命令一律打印明确的「尚未实现」提示并返回**非 0** 退出码（``2``），
 **绝不静默成功**——既保证 ``--help`` 可用，也让上游编排脚本能立刻发现「该阶段还没接上」。
 （T05.1 落地后 :data:`PENDING_COMMANDS` 为**空**：全部子命令均已实现。）
@@ -51,6 +52,7 @@ IMPLEMENTED_COMMANDS: tuple[str, ...] = (
     "extract-video",
     "extract",
     "annotate",
+    "rebuild-hazards",
     "prioritize",
     "curate",
     "freeze-holdout",
@@ -77,6 +79,7 @@ _COMMAND_HELP: dict[str, str] = {
     "extract-video": "ffmpeg 抽帧 + 关键帧去重，产出候选关键帧。",
     "extract": "复用母项目 run_extraction 做通用 YOLO 零样本初检。",
     "annotate": "复用母项目两段式标注，私有 VLM 复核纠偏。",
+    "rebuild-hazards": "只重建隐患报告（从现有标注 + 原始响应），不调用 VLM、不重新标注。",
     "prioritize": "按不确定性排序，产出 priority_queue.jsonl。",
     "curate": "质量过滤 + 版本化数据集构建。",
     "freeze-holdout": "冻结固定 holdout 并登记 sha256。",
