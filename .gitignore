@@ -105,3 +105,16 @@ desktop.ini
 own/*/input/
 own/*/workspace/
 open/weights/
+
+# ---------------------------------------------------------------------------
+# deliverables/figures/：含真实素材画面的可视化图，**绝不入库**
+#   只保留程序绘制的图（01_timeline*.png / 05_eval_compare.png —— 纯线条/柱状，无画面）
+#   其余为抽帧可视化 / 标注框对比 / 复核抽样，均含真实画面，按项目铁律不得复制进仓库
+# ---------------------------------------------------------------------------
+deliverables/figures/02_frames_sample*.png
+deliverables/figures/03_yolo_vs_vlm*.png
+deliverables/figures/04_review_queue*.png
+deliverables/figures/grid_all.png
+deliverables/figures/hook_rigging_*.png
+deliverables/figures/pair_*.png
+

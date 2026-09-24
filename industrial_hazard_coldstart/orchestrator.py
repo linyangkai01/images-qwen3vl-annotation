@@ -15,6 +15,10 @@
   ``annotations.jsonl`` + ``raw_responses`` 重算），**不调用 VLM、不重新标注、不读
   candidates.jsonl**。用于给旧代码产出的报告补上新字段（如幻觉过滤标记），
   省下整轮标注耗时（:func:`rebuild_hazard_report`）；
+- ``relations``（根治方案 v2 §8 阶段 3）—— 吃 ``workspace/review/annotations.jsonl``
+  的**标注框**，用射影判据（Singh & Seif 2026）产出**独立**的
+  ``workspace/relations/relations.jsonl``（人下吊物 / 歪拉斜吊 + 时序持久命中）。
+  **留位能力，不接入交付指标**——见 :func:`relations.run_relations`；
 - ``prioritize``（T03.4）—— 对标注记录做不确定性采样，产出
   ``workspace/review/priority_queue.jsonl``；
 - ``curate``（T04.1）—— 质量过滤 + 版本化数据集构建（:func:`run_curate`）；
@@ -83,6 +87,7 @@ from industrial_hazard_coldstart.knowledge import (
     overall_risk_of,
     recommendation_of,
 )
+from industrial_hazard_coldstart.relations import run_relations
 from industrial_hazard_coldstart.taxonomy import layer_of_hazard
 from industrial_hazard_coldstart.video_decode import discover_videos, run_video_extract
 
@@ -91,6 +96,7 @@ __all__ = [
     "run_cycle",
     "run_annotate",
     "rebuild_hazard_report",
+    "run_relations",
     "run_prioritize",
     "run_curate",
     "run_freeze_holdout",
@@ -108,6 +114,7 @@ SUPPORTED_STAGES: tuple[str, ...] = (
     "extract",
     "annotate",
     "rebuild-hazards",
+    "relations",
     "prioritize",
     "curate",
     "freeze-holdout",
@@ -978,6 +985,9 @@ def run_cycle(
 
     if normalized == "rebuild-hazards":
         return rebuild_hazard_report(config)
+
+    if normalized == "relations":
+        return run_relations(config)
 
     if normalized == "prioritize":
         return run_prioritize(config)

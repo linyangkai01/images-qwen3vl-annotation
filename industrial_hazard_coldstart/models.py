@@ -333,6 +333,11 @@ class RelationFinding:
     """几何关系层的结论（本期留位，不接入交付指标）。
 
     ``supporting`` 记录支撑该结论的检测框（``Detection.to_dict`` 形式）。
+
+    三级输出（方案阶段 2 第 7 项）：``verdict`` 取
+    ``confirmed_danger`` / ``suspected`` / ``needs_review``（空串表示无结论），
+    ``margin`` 为**决策余量** ``|Δ|``（到判据边界的归一化距离，越大越确定），
+    ``evidence`` 记录可复核的实测量（``r_clr`` / 水平距 / 坠落区半宽 …）。
     """
 
     hazard_id: str
@@ -340,6 +345,12 @@ class RelationFinding:
     confidence: float = 0.0
     supporting: list[dict[str, Any]] = field(default_factory=list)
     notes: str = ""
+    #: 三级判定（``confirmed_danger`` / ``suspected`` / ``needs_review``；空串=无结论）。
+    verdict: str = ""
+    #: 决策余量 ``|Δ|``（归一化，≥0 表示命中，越大越确定）。
+    margin: float = 0.0
+    #: 可复核的实测量（判据各分量的具体数值）。
+    evidence: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -348,6 +359,9 @@ class RelationFinding:
             "confidence": self.confidence,
             "supporting": [dict(item) for item in _list_or_empty(self.supporting)],
             "notes": self.notes,
+            "verdict": self.verdict,
+            "margin": self.margin,
+            "evidence": _dict_or_empty(self.evidence),
         }
 
     @classmethod
@@ -358,6 +372,9 @@ class RelationFinding:
             confidence=_float_or(data.get("confidence"), 0.0),
             supporting=_as_dict_list(data.get("supporting")),
             notes=_str_or_empty(data.get("notes", "")),
+            verdict=_str_or_empty(data.get("verdict", "")),
+            margin=_float_or(data.get("margin"), 0.0),
+            evidence=_dict_or_empty(data.get("evidence")),
         )
 
 
