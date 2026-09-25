@@ -22,6 +22,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -403,6 +404,70 @@ class RelationsIsolationTest(unittest.TestCase):
 
         source = Path(relations_module.__file__).read_text(encoding="utf-8")
         self.assertIn("from industrial_hazard_coldstart.layers import geometry", source)
+
+
+# --------------------------------------------------------------------------- #
+# 10. D-4-3 判据透视局限：结论一律降级 needs_review
+# --------------------------------------------------------------------------- #
+class ObliqueLiftPerspectiveTest(unittest.TestCase):
+    """``find_oblique_lift`` 用 **2D 画面角度**、未考虑透视与深度差 → 结论**一律**需人工确认。
+
+    真实素材上，吊物框大（近）、吊钩框小（远）时深度差大，**物理垂直**也会呈大角度斜线；
+    故不论角度多大，``verdict`` 必须恒为 ``needs_review``，**绝不给** ``confirmed_danger``。
+    """
+
+    def _oblique_dets(self, angle_deg: float) -> list[Detection]:
+        """构造使 ``vertical_angle_deg ≈ angle_deg`` 的 load/hook（aspect_ratio=1）。"""
+        dy = 0.15
+        dx = dy * math.tan(math.radians(angle_deg))
+        load_cx = max(0.5, 0.05 + dx)  # 保证 hook_cx = load_cx - dx ≥ 0.05
+        load_cy = 0.6
+        hook_cx = load_cx - dx
+        hook_cy = load_cy - dy
+        return [
+            _det("load", (load_cx - 0.1, load_cy - 0.05, load_cx + 0.1, load_cy + 0.05)),
+            _det("hook", (hook_cx - 0.02, hook_cy - 0.02, hook_cx + 0.02, hook_cy + 0.02)),
+        ]
+
+    def test_extreme_angle_still_needs_review(self) -> None:
+        findings = geometry.find_oblique_lift(self._oblique_dets(80.0))
+        self.assertEqual(len(findings), 1)
+        self.assertGreater(findings[0].evidence["angle_deg"], 70.0)
+        self.assertEqual(findings[0].verdict, geometry.VERDICT_REVIEW)
+
+    def test_moderate_angle_also_needs_review(self) -> None:
+        findings = geometry.find_oblique_lift(self._oblique_dets(30.0))
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].verdict, geometry.VERDICT_REVIEW)
+
+    def test_never_confirmed_regardless_of_angle(self) -> None:
+        for angle in (20.0, 30.0, 45.0, 60.0, 75.0, 80.0):
+            with self.subTest(angle=angle):
+                findings = geometry.find_oblique_lift(self._oblique_dets(angle))
+                self.assertEqual(len(findings), 1)
+                self.assertEqual(findings[0].verdict, geometry.VERDICT_REVIEW)
+                self.assertNotEqual(findings[0].verdict, geometry.VERDICT_CONFIRMED)
+
+    def test_evidence_has_perspective_warning(self) -> None:
+        findings = geometry.find_oblique_lift(self._oblique_dets(60.0))
+        self.assertEqual(len(findings), 1)
+        warning = findings[0].evidence.get("perspective_warning")
+        self.assertIsInstance(warning, str)
+        self.assertIn("透视", warning)
+        self.assertIn("深度", warning)
+        self.assertEqual(warning, geometry.OBLIQUE_PERSPECTIVE_WARNING)
+
+    def test_margin_still_reflects_angle(self) -> None:
+        small = geometry.find_oblique_lift(self._oblique_dets(20.0))[0]
+        large = geometry.find_oblique_lift(self._oblique_dets(80.0))[0]
+        self.assertGreater(large.margin, small.margin)
+
+    def test_d53_criterion_unaffected(self) -> None:
+        """D-5-3（射影解）不受本次 D-4-3 降级影响，仍能给出 confirmed_danger。"""
+        findings = geometry.find_person_under_load(_ground_view_dets())
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].hazard_id, "D-5-3")
+        self.assertEqual(findings[0].verdict, geometry.VERDICT_CONFIRMED)
 
 
 if __name__ == "__main__":

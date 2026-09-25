@@ -6,7 +6,11 @@
 框是**输入**不是结论：
 
 - ``D-5-3``（人员站在吊物下方）—— 见下「判据重写」；
-- ``D-4-3``（歪拉斜吊）—— 需判断吊索/吊钩与吊物中心的连线**偏离竖直**的角度；
+- ``D-4-3``（歪拉斜吊）—— 需判断吊索/吊钩与吊物中心的连线**偏离竖直**的角度。
+  ⚠️ **已知局限**：现判据用**纯 2D 画面角度**，未考虑透视与深度差，强透视下**物理垂直**
+  也可能呈大角度斜线 → 会把物理垂直误判为歪拉斜吊（与 ``D-5-3`` 原始缺陷**同类**：
+  用 2D 量代替 3D 量）。故 :func:`find_oblique_lift` 产出的结论**一律**标
+  ``needs_review``（需人工看），**不给「确定危险」**；修正需深度信息，见方案 §5「不做 1」；
 - （``D-2-1`` / ``D-2-4`` 同属本层，见 :data:`taxonomy.S1_GEOMETRY_HAZARD_IDS`。）
 
 **判据重写（根治 v2 方案 §4.4，Singh & Seif 2026, arXiv:2607.16351）**：
@@ -55,6 +59,7 @@ __all__ = [
     # 阈值常量
     "MIN_CONTAINMENT_RATIO",
     "OBLIQUE_ANGLE_THRESHOLD_DEG",
+    "OBLIQUE_PERSPECTIVE_WARNING",
     "CLEARANCE_RATIO_THRESHOLD",
     "VERTICAL_GATE_PX",
     "FALL_ZONE_LATERAL_START_PX",
@@ -91,6 +96,19 @@ MIN_CONTAINMENT_RATIO: float = 0.85
 
 #: 「歪拉斜吊」判定的偏离竖直角度阈值（度）。超过即视为歪拉斜吊。
 OBLIQUE_ANGLE_THRESHOLD_DEG: float = 15.0
+
+#: 「歪拉斜吊」判据的**已知局限**说明（2D 画面角度未考虑透视 → 结论一律降级人工确认）。
+#:
+#: :func:`vertical_angle_deg` 用**纯 2D 画面坐标**算角度：在强透视下，**物理上垂直**的
+#: 吊钩与吊物，若**深度差大**（典型信号：吊物框远大于吊钩框），在画面里也会呈**大角度斜线**
+#: ——故该判据会把物理垂直误判为「歪拉斜吊」。这是与 ``D-5-3`` 原始缺陷**同一类**的问题
+#: （用 2D 量代替 3D 量）。修正需**深度信息**，而方案 §5「不做 1 · 单目深度估计」已判其为
+#: 净负担，故本批**不给「确定危险」**、一律标 :data:`VERDICT_REVIEW`（需人工看）。
+OBLIQUE_PERSPECTIVE_WARNING: str = (
+    "本判据基于 2D 画面角度，未考虑透视与深度差：吊物与吊钩框尺寸差异大时（深度差大），"
+    "物理垂直也可能呈大角度斜线。结论须人工确认。"
+    "（修正需深度信息，见 PLAN-根治方案-v2 §5「不做 1 · 单目深度估计」。）"
+)
 
 #: 本层服务的隐患 id（与 :mod:`taxonomy` 的分桶一致）。
 HAZARD_PERSON_UNDER_LOAD: str = "D-5-3"
@@ -644,6 +662,16 @@ def find_oblique_lift(
     :func:`vertical_angle_deg`；超过 ``angle_threshold_deg`` → 产出结论。
     ``supporting`` 依次为 ``[load, hook]``。
 
+    ⚠️ **已知局限（透视）**：:func:`vertical_angle_deg` 用**纯 2D 画面坐标**算角度。
+    在强透视下，**物理上垂直**的吊钩与吊物，若**深度差大**（典型信号：吊物框远大于
+    吊钩框），在画面里也会呈**大角度斜线** → 会把物理垂直**误判**为「歪拉斜吊」。
+    这与 ``D-5-3`` 的原始缺陷**同类**（用 2D 量代替 3D 量）。修正需**深度信息**，而
+    方案 §5「不做 1 · 单目深度估计」已判其为净负担。
+
+    **因此本函数产出的结论一律标 ``needs_review``（需人工看）**——**不管角度多大**，
+    绝不给 ``confirmed_danger``；``margin`` 仍保留（反映角度偏离程度，供排序 / 复核），
+    ``evidence`` 附 :data:`OBLIQUE_PERSPECTIVE_WARNING` 显式说明。
+
     Args:
         dets: 同一帧的检测框集合。
         angle_threshold_deg: 偏离竖直的角度阈值（度）。
@@ -651,7 +679,7 @@ def find_oblique_lift(
         image_size: 图像尺寸（本判据在归一化空间计算，仅写入 evidence 供复核）。
 
     Returns:
-        关系结论列表（可能为空）。
+        关系结论列表（可能为空）；每条 ``verdict`` **恒为** ``needs_review``。
     """
     detections = list(dets)
     hooks: list[Detection] = []
@@ -670,7 +698,8 @@ def find_oblique_lift(
         )
         angle = vertical_angle_deg(load, nearest, aspect_ratio=aspect_ratio)
         if angle >= angle_threshold_deg:
-            # 角度越大越确定（归一化到 [0,1] 的决策余量）。
+            # margin 反映角度偏离程度（供排序 / 复核），但**不**用于映射三级判定：
+            # 判据在透视下不可靠 → verdict 一律 needs_review（见 docstring / 常量说明）。
             margin = min(1.0, (angle - angle_threshold_deg) / max(angle_threshold_deg, 1e-6))
             findings.append(
                 _finding(
@@ -678,14 +707,16 @@ def find_oblique_lift(
                     "oblique_lift",
                     [load, nearest],
                     f"吊点连线偏离竖直 {angle:.1f}°（阈值 {angle_threshold_deg:.1f}°）；"
+                    "2D 画面角度未考虑透视，结论一律需人工确认；"
                     "本期留位，不接入交付指标。",
-                    verdict=verdict_for_margin(margin),
+                    verdict=VERDICT_REVIEW,
                     margin=margin,
                     evidence={
                         "angle_deg": round(angle, 6),
                         "angle_threshold_deg": angle_threshold_deg,
                         "aspect_ratio": aspect_ratio,
                         "image_size": list(image_size) if image_size else None,
+                        "perspective_warning": OBLIQUE_PERSPECTIVE_WARNING,
                     },
                 )
             )
