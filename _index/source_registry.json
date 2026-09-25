@@ -1,0 +1,45 @@
+{
+  "registry_version": "1.0",
+  "created_at": "2026-09-25T20:23:42",
+  "note": "跨来源唯一真源。来源判定**查表**，不按路径推断（决策 3 后）。",
+  "source_roots": {
+    "own": "own",
+    "open": "open"
+  },
+  "resource_sources": [
+    "own",
+    "open"
+  ],
+  "root_mappings": [
+    {
+      "root": "D:/WorkPlace/industrial-data/吊装操作视频-珠海",
+      "source": "own",
+      "source_ref": "企业私有 · 珠海吊装作业视频（甲方提供）",
+      "license": "企业私有，非开源；不得对外公开或用于开源发布",
+      "registered_at": "2026-09-25T20:23:42"
+    },
+    {
+      "root": "D:/WorkPlace/industrial-data/吊装类安全隐患-宿州基地",
+      "source": "own",
+      "source_ref": "企业私有 · 宿州基地吊装隐患照片（甲方提供）",
+      "license": "企业私有，非开源；不得对外公开或用于开源发布",
+      "registered_at": "2026-09-25T20:23:42"
+    },
+    {
+      "root": "D:/WorkPlace/industrial-data/open-ppe-roboflow",
+      "source": "open",
+      "source_ref": "开源 PPE 数据集（Roboflow 公开来源）",
+      "license": "开源；仅用于对比实验，不进主训练集，产出不作为交付物",
+      "registered_at": "2026-09-25T20:23:42"
+    },
+    {
+      "root": "D:/WorkPlace/industrial-data/吊装作业监控-1F-20260716",
+      "source": "own",
+      "source_ref": "企业私有 · 吊装作业监控录像（1F C 1 / 1F C 9 两路，2026-07-16 10:30~23:57）",
+      "license": "企业私有，非开源；不得对外公开或用于开源发布",
+      "registered_at": "2026-09-25T20:24:16"
+    }
+  ],
+  "content_hash": "58fa47adb73f70f589900d841f37264d9347a6b5441c8f01305ce77047461791",
+  "updated_at": "2026-09-25T20:24:16"
+}
